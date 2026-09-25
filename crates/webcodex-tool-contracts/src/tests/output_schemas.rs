@@ -448,6 +448,15 @@ fn agent_identity_listing_readiness_schema_is_sparse_and_non_authoritative() {
         .unwrap()
         .iter()
         .any(|field| field == "production_auto_resume_available"));
+    assert!(agent["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "agent_continuation_ref"));
+    assert_eq!(
+        properties["agent_continuation_ref"]["anyOf"][0]["pattern"],
+        crate::AGENT_CONTINUATION_REF_PATTERN
+    );
     for forbidden in [
         "client_window",
         "client_window_key",
@@ -1906,7 +1915,7 @@ fn key_tool_output_schemas_include_expected_fields() {
         "auth_enabled",
         "configured_public_url",
         "effective_config",
-        "agents",
+        "runners",
         "projects",
         "jobs",
         "tools",
@@ -1917,6 +1926,13 @@ fn key_tool_output_schemas_include_expected_fields() {
             has_output_field("runtime_status", field),
             "runtime_status missing {field}"
         );
+    }
+    assert!(!has_output_field("runtime_status", "agents"));
+    for field in ["runners", "summary", "count"] {
+        assert!(has_output_field("list_runners", field));
+    }
+    for legacy in ["agents", "clients"] {
+        assert!(!has_output_field("list_runners", legacy));
     }
     for field in ["projects", "count", "recommended_for_smoke"] {
         assert!(

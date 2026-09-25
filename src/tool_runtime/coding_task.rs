@@ -1121,6 +1121,7 @@ impl ToolRuntime {
                     > 0,
             )
             .await;
+        let session_ref = self.session_reference_for_id(&session_summary.session_id, auth);
         let mut output = json!({
             "detail": detail.as_str(),
             "project": project.clone(),
@@ -1170,6 +1171,9 @@ impl ToolRuntime {
             "llm_summary": false,
             "warnings": warnings,
         });
+        if let Some(session_ref) = session_ref.as_deref() {
+            output["session"]["session_ref"] = json!(session_ref);
+        }
         if let Some(tool_manifest) = tool_manifest {
             output["tool_manifest"] = tool_manifest;
         }
@@ -1203,7 +1207,7 @@ impl ToolRuntime {
         let project_resolution_value =
             serde_json::to_value(&project_resolution).unwrap_or_else(|_| json!({}));
         let project_ref = self.project_reference_for_resolved(&resolved, auth);
-        let startup_brief = build_startup_brief(StartupBriefInput {
+        let mut startup_brief = build_startup_brief(StartupBriefInput {
             guidance_profile: startup.guidance_profile,
             detail,
             requested_project: &project,
@@ -1230,6 +1234,9 @@ impl ToolRuntime {
             canonical_repository_root_matches,
             runtime_status_call_failed,
         });
+        if let Some(session_ref) = session_ref.as_deref() {
+            startup_brief["session"]["session_ref"] = json!(session_ref);
+        }
         let result = if detail == StartupDetail::Full {
             output["startup_brief"] = startup_brief;
             ToolResult::ok(output)
@@ -2334,6 +2341,8 @@ struct WorkOnProjectBriefProjection {
 #[derive(Deserialize)]
 struct WorkOnProjectSessionProjection {
     session_id: String,
+    #[serde(default)]
+    session_ref: Option<String>,
     continuation: String,
     execution_context: sessions::SessionExecutionContext,
 }
@@ -2731,6 +2740,9 @@ fn project_work_on_project_output_inner(
     }));
     if let Some(knowledge_association) = projection.project.knowledge_association {
         result.output["knowledge_association"] = knowledge_association;
+    }
+    if let Some(session_ref) = projection.session.session_ref {
+        result.output["session_ref"] = json!(session_ref);
     }
     if let Some(project_ref) = projection.project.project_ref {
         result.output["project_ref"] = json!(project_ref);
@@ -3239,7 +3251,7 @@ pub(crate) fn project_coding_agent_providers(
     runtime_status: &Value,
 ) -> Vec<webcodex_core::coding_agent::CodingAgentProviderSummary> {
     runtime_status
-        .pointer("/agents/clients")
+        .pointer("/runners/clients")
         .and_then(Value::as_array)
         .and_then(|clients| {
             clients.iter().find(|client| {
@@ -3270,7 +3282,7 @@ fn owning_runner_available(
     }
     Some(
         runtime_status
-            .pointer("/agents/summary/clients")
+            .pointer("/runners/clients")
             .and_then(Value::as_array)
             .and_then(|clients| {
                 clients.iter().find(|client| {
@@ -3600,10 +3612,8 @@ mod startup_runner_tests {
     #[test]
     fn missing_target_runner_is_unavailable_even_when_a_peer_is_online() {
         let runtime_status = json!({
-            "agents": {
-                "summary": {
-                    "clients": [{"client_id": "peer", "status": "online"}]
-                }
+            "runners": {
+                "clients": [{"client_id": "peer", "status": "online"}]
             }
         });
         assert_eq!(
@@ -3615,18 +3625,35 @@ mod startup_runner_tests {
     #[test]
     fn target_runner_online_is_available_even_when_a_peer_is_stale() {
         let runtime_status = json!({
-            "agents": {
-                "summary": {
-                    "clients": [
-                        {"client_id": "peer", "status": "stale"},
-                        {"client_id": "target", "status": "online"}
-                    ]
-                }
+            "runners": {
+                "clients": [
+                    {"client_id": "peer", "status": "stale"},
+                    {"client_id": "target", "status": "online"}
+                ]
             }
         });
         assert_eq!(
             owning_runner_available(&resolved_agent("target"), &runtime_status, false),
             Some(true)
+        );
+    }
+    #[test]
+    fn runner_health_failure_stays_unknown_and_peer_does_not_mask_offline_target() {
+        let status = json!({"runners":{"clients":[
+            {"client_id":"target","status":"stale"},
+            {"client_id":"peer","status":"online"}
+        ]}});
+        assert_eq!(
+            owning_runner_available(&resolved_agent("target"), &status, false),
+            Some(false)
+        );
+        assert_eq!(
+            owning_runner_available(&resolved_agent("target"), &status, true),
+            None
+        );
+        assert_eq!(
+            startup_agent_check(&json!({}), None),
+            ("warn", Some("agent_health_unknown"))
         );
     }
 }

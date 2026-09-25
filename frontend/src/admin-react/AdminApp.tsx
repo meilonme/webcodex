@@ -1,3 +1,4 @@
+import { displayProjectPath, projectPresentationName } from "../ui/projectPresentation.js";
 import { Alert, Badge, Button, Checkbox, Menu, Modal, PasswordInput, Switch, Table, TextInput } from "@mantine/core";
 import { Activity, AlertTriangle, Ellipsis, Folder, LayoutDashboard, LockKeyhole, MoonStar, Plus, RefreshCw, Sun, Users } from "lucide-react";
 import { motion, useReducedMotion } from "motion/react";
@@ -304,12 +305,12 @@ export function AdminApp() {
   const overview = dashboard.overview;
   const overviewItems = [
     ["Server", display(overview.version), `${display(overview.build_commit)} · ${display(overview.authority_mode)}`],
-    ["Agents", `${display(overview.agents_online || 0)} / ${display(overview.agents_total || 0)}`, "online now"],
+    ["Runners", `${display(overview.runners_online || 0)} / ${display(overview.runners_total || 0)}`, "online now"],
     ["Projects", `${display(overview.projects_online || 0)} / ${display(overview.projects_total || 0)}`, "ready for work"],
     ["Jobs", display(overview.active_jobs || 0), display(overview.version_compatibility || "compatibility unknown")],
   ];
   const navigation = [
-    ["overview-section", "Overview", LayoutDashboard], ["devices-section", "Agents", Users],
+    ["overview-section", "Overview", LayoutDashboard], ["devices-section", "Runners", Users],
     ["projects-section", "Projects", Folder], ["diagnostics-section", "Diagnostics", AlertTriangle],
   ] as const;
 
@@ -353,8 +354,8 @@ export function AdminApp() {
             <span>{label}</span><strong className={index ? "metric" : ""}>{value}</strong><small>{subtitle}</small>
           </div>)}</div>
         </Section>
-        <Section id="devices-section" eyebrow="Connected fleet" title="Agents" error={sectionError("devices")}>
-          <DataTable label="Devices and Agents" empty="No devices observed." headings={["Name", "Client", "Status", "Transport", "Host", "Last seen", "Capabilities", "Projects", "Jobs", "Protocol", "Build alignment"]}
+        <Section id="devices-section" eyebrow="Connected fleet" title="Runners" error={sectionError("devices")}>
+          <DataTable label="Connected Runners" empty="No Runners observed." headings={["Name", "Client", "Status", "Transport", "Host", "Last seen", "Capabilities", "Projects", "Jobs", "Protocol", "Build alignment"]}
             rows={dashboard.devices.map((device) => [display(device.display_name), <code>{display(device.client_id)}</code>, <Status value={device.status} />,
               display(device.transport), display(device.hostname), <code>{display(device.last_seen)}</code>, display(capabilityLabels(device.capabilities).join(", ")),
               display(device.project_count), display(device.active_jobs), <Status value={device.protocol_compatibility || device.compatibility} />, <span title="Build identity is diagnostic, not functional compatibility">{display(device.build_alignment)}</span>])} />
@@ -363,7 +364,7 @@ export function AdminApp() {
           actions={<div className="section-actions"><Button variant="default" onClick={(event) => openCreate("register", event.currentTarget)}>Register</Button>
             <Button className="admin-primary" leftSection={<Plus size={15} />} onClick={(event) => openCreate("create", event.currentTarget)}>Create project</Button></div>}>
           <DataTable label="Projects" empty="No projects registered." headings={["Runtime project", "Name", "Client", "Path", "Lifecycle", "Jobs", "Git", "Patch", "Shell profile", "Protocol", "Build alignment", "Console", "Actions"]}
-            rows={dashboard.projects.map((project) => [<code>{display(project.id)}</code>, display(project.name), display(project.client_id), <code title={String(project.path || "")}>{display(project.path)}</code>,
+            rows={dashboard.projects.map((project) => [<code>{display(project.id)}</code>, projectPresentationName({ name: String(project.name || ""), path: String(project.path || ""), id: String(project.id || "") }), display(project.client_id), <code title={displayProjectPath(String(project.path || ""))}>{display(displayProjectPath(String(project.path || "")))}</code>,
               <Status value={project.lifecycle_status || project.readiness} />, display(project.active_jobs), <Status value={project.git_available} />,
               <Status value={project.allow_patch} />, <Status value={project.shell_profile_status} />, <Status value={project.protocol_compatibility || project.compatibility} />, <span title="Build identity is diagnostic, not functional compatibility">{display(project.build_alignment)}</span>,
               display(project.console_hint), <ProjectActionMenu project={project} onAction={openAction} />])} />
