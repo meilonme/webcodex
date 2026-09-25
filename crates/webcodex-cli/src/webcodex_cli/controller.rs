@@ -1098,9 +1098,9 @@ pub(crate) fn parse_controller_command(args: &[String]) -> Result<ControllerComm
     if matches!(command, "--help" | "-h") {
         return Err(super::controller_usage().to_string());
     }
-    let mut config = default_controller_config_path()?;
-    let mut environment_file = default_controller_environment_path()?;
-    let mut service_file = default_controller_service_file()?;
+    let mut config = None;
+    let mut environment_file = None;
+    let mut service_file = None;
     let mut overwrite = false;
     let mut no_start = false;
     let mut json = false;
@@ -1110,22 +1110,22 @@ pub(crate) fn parse_controller_command(args: &[String]) -> Result<ControllerComm
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--config" => {
-                config = PathBuf::from(
+                config = Some(PathBuf::from(
                     iter.next()
                         .ok_or_else(|| "--config requires PATH".to_string())?,
-                )
+                ))
             }
             "--environment-file" => {
-                environment_file = PathBuf::from(
-                    iter.next()
-                        .ok_or_else(|| "--environment-file requires PATH".to_string())?,
-                )
+                environment_file =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
+                        "--environment-file requires PATH".to_string()
+                    })?))
             }
             "--service-file" => {
-                service_file = PathBuf::from(
+                service_file = Some(PathBuf::from(
                     iter.next()
                         .ok_or_else(|| "--service-file requires PATH".to_string())?,
-                )
+                ))
             }
             "--overwrite" => overwrite = true,
             "--no-start" => no_start = true,
@@ -1146,33 +1146,64 @@ pub(crate) fn parse_controller_command(args: &[String]) -> Result<ControllerComm
             other => return Err(format!("unknown controller {command} option: {other}")),
         }
     }
+    let resolve_config = || {
+        config
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(default_controller_config_path)
+    };
+    let resolve_environment_file = || {
+        environment_file
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(default_controller_environment_path)
+    };
+    let resolve_service_file = || {
+        service_file
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(default_controller_service_file)
+    };
     match command {
-        "init" => Ok(ControllerCommand::Init { config, overwrite }),
-        "run" => Ok(ControllerCommand::Run { config }),
+        "init" => Ok(ControllerCommand::Init {
+            config: resolve_config()?,
+            overwrite,
+        }),
+        "run" => Ok(ControllerCommand::Run {
+            config: resolve_config()?,
+        }),
         "install" => Ok(ControllerCommand::Install {
-            config,
-            environment_file,
-            service_file,
+            config: resolve_config()?,
+            environment_file: resolve_environment_file()?,
+            service_file: resolve_service_file()?,
             overwrite,
             no_start,
         }),
         "start" => Ok(ControllerCommand::Start {
-            config,
-            service_file,
+            config: resolve_config()?,
+            service_file: resolve_service_file()?,
         }),
-        "status" => Ok(ControllerCommand::Status { config, json }),
-        "doctor" => Ok(ControllerCommand::Doctor {
-            config,
-            environment_file,
+        "status" => Ok(ControllerCommand::Status {
+            config: resolve_config()?,
             json,
         }),
-        "stop" => Ok(ControllerCommand::Stop { service_file }),
+        "doctor" => Ok(ControllerCommand::Doctor {
+            config: resolve_config()?,
+            environment_file: resolve_environment_file()?,
+            json,
+        }),
+        "stop" => Ok(ControllerCommand::Stop {
+            service_file: resolve_service_file()?,
+        }),
         "restart" => Ok(ControllerCommand::Restart {
-            config,
-            service_file,
+            config: resolve_config()?,
+            service_file: resolve_service_file()?,
             component,
         }),
-        "logs" => Ok(ControllerCommand::Logs { config, lines }),
+        "logs" => Ok(ControllerCommand::Logs {
+            config: resolve_config()?,
+            lines,
+        }),
         other => Err(format!(
             "unknown controller subcommand: {other}\n\n{}",
             super::controller_usage()
@@ -1373,18 +1404,21 @@ mod tests {
             "tunnel".into(),
             "--config".into(),
             "/tmp/controller.toml".into(),
+            "--service-file".into(),
+            "/tmp/webcodex-controller.service".into(),
         ])
         .unwrap();
         assert_eq!(
             cmd,
             ControllerCommand::Restart {
                 config: PathBuf::from("/tmp/controller.toml"),
-                service_file: default_controller_service_file().unwrap(),
+                service_file: PathBuf::from("/tmp/webcodex-controller.service"),
                 component: Some(Component::Tunnel)
             }
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn controller_service_unit_runs_controller_with_exact_config() {
         let unit = render_controller_systemd_unit(
