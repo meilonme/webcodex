@@ -133,9 +133,9 @@ webcodex controller 是 WSL/Linux 场景下的本地终端控制平面。V0 不�
     webcodex controller logs --lines 100
     webcodex controller stop
 
-V0 使用本地 Server 作为依赖根；启用 Runner 或 Tunnel 时必须同时启用 Server。Controller 不接管已经由 webcodex.service / webcodex.socket / webcodex-runner.service 管理的运行实例，检测到已有服务处于 active 状态时会拒绝启动，避免双重 ownership。
+V0 使用本地 Server 作为依赖根；启用 Runner 或 Tunnel 时必须同时启用 Server。Runner 配置中的 `server_url` 必须与 Controller 管理的 loopback Server 一致；remote Server topology 会在启动 Runner 或使用任何本地 Server credential 之前被拒绝。Controller 不接管已经由 webcodex.service / webcodex.socket / webcodex-runner.service 管理的运行实例，检测到已有服务处于 active 状态时会拒绝启动，避免双重 ownership。
 
-`controller install` 默认安装 user service 到 `~/.config/systemd/user/webcodex-controller.service`，并通过 `systemctl --user` 管理 Controller 的 start/stop/restart 生命周期。默认可选环境文件是 `~/.config/webcodex/controller.env`；启用 OpenAI Tunnel 且需要长期后台启动时，可将 `CONTROL_PLANE_TUNNEL_ID` 与 `CONTROL_PLANE_API_KEY` 放入该文件。Controller service 不直接托管独立的 Server/Runner systemd unit，下层进程仍由 Controller 自己作为父进程管理。
+`controller install` 默认安装 user service 到 `~/.config/systemd/user/webcodex-controller.service`，并通过 `systemctl --user` 管理 Controller 的 start/stop/restart 生命周期。默认可选环境文件是 `~/.config/webcodex/controller.env`；启用 OpenAI Tunnel 且需要长期后台启动时，可将 `CONTROL_PLANE_TUNNEL_ID` 与 `CONTROL_PLANE_API_KEY` 放入该文件。`controller doctor` 会从当前进程环境或指定的 `--environment-file` 检查同一对凭据；Tunnel control-plane credential 不会继续传给受管的 Server/Runner 子进程。Controller service 不直接托管独立的 Server/Runner systemd unit，下层进程仍由 Controller 自己作为父进程管理。
 
 Windows 支持 `server init`、前台 `server run` 与显式 `share`。受管 service 生命周期（`install`、`start`、`stop`、`restart`、`logs`、`uninstall`）仍只支持 Linux。
 

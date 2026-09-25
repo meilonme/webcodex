@@ -33,6 +33,7 @@ pub(crate) enum ControllerCommand {
         no_start: bool,
     },
     Start {
+        config: PathBuf,
         service_file: PathBuf,
     },
     Status {
@@ -41,6 +42,7 @@ pub(crate) enum ControllerCommand {
     },
     Doctor {
         config: PathBuf,
+        environment_file: PathBuf,
         json: bool,
     },
     Stop {
@@ -441,65 +443,77 @@ fn read_config(path: &Path) -> Result<ControllerConfig, String> {
     validate_config(&cfg)?;
     Ok(cfg)
 }
-fn read_env_value(path: &Path, key: &str) -> Result<Option<String>, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line.strip_prefix("export ").unwrap_or(line).trim();
-        let Some((k, value)) = line.split_once('=') else {
-            continue;
-        };
-        if k.trim() != key {
-            continue;
-        }
-        let value = value.trim();
-        let value = if value.len() >= 2
-            && ((value.starts_with('"') && value.ends_with('"'))
-                || (value.starts_with('\'') && value.ends_with('\'')))
-        {
-            &value[1..value.len() - 1]
-        } else {
-            value
-        };
-        return Ok(Some(value.to_string()));
-    }
-    Ok(None)
-}
 fn server_base_url(env_file: &Path) -> Result<String, String> {
-    let addr = read_env_value(env_file, "WEBCODEX_ADDR")?
-        .ok_or_else(|| format!("{} does not define WEBCODEX_ADDR", env_file.display()))?;
-    let mut socket: std::net::SocketAddr = addr
-        .parse()
-        .map_err(|e| format!("invalid WEBCODEX_ADDR {addr:?}: {e}"))?;
-    if socket.ip().is_unspecified() {
-        socket.set_ip(if socket.is_ipv4() {
-            std::net::Ipv4Addr::LOCALHOST.into()
-        } else {
-            std::net::Ipv6Addr::LOCALHOST.into()
-        });
-    }
-    if !socket.ip().is_loopback() {
-        return Err("Controller V0 requires a loopback Server address".to_string());
-    }
-    Ok(format!("http://{socket}"))
+    super::server::derive_regular_tunnel_server_url(env_file)
+        .map_err(|error| format!("Controller requires a loopback Server: {error}"))
 }
+
 fn server_token(env_file: &Path) -> Result<Option<String>, String> {
     if let Ok(value) = std::env::var("WEBCODEX_TOKEN") {
         if !value.trim().is_empty() {
             return Ok(Some(value));
         }
     }
-    read_env_value(env_file, "WEBCODEX_TOKEN")
+    super::read_env_file_value(env_file, "WEBCODEX_TOKEN")
 }
+
 fn runner_view(path: &Path) -> Result<RunnerConfigView, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read Runner config {}: {e}", path.display()))?;
     toml::from_str(&text)
         .map_err(|e| format!("failed to parse Runner config {}: {e}", path.display()))
+}
+
+fn same_server_origin(left: &str, right: &str) -> bool {
+    left.trim_end_matches('/')
+        .eq_ignore_ascii_case(right.trim_end_matches('/'))
+}
+
+fn validate_runner_target(view: &RunnerConfigView, local_server_url: &str) -> Result<(), String> {
+    if same_server_origin(&view.server_url, local_server_url) {
+        return Ok(());
+    }
+    Err(format!(
+        "Controller V0 manages one local Server; Runner server_url {:?} does not match {}",
+        view.server_url, local_server_url
+    ))
+}
+
+fn runtime_has_online_runner(output: &Value, client_id: &str) -> bool {
+    output
+        .pointer("/runners/clients")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("client_id").and_then(Value::as_str) == Some(client_id)
+                    && item.get("status").and_then(Value::as_str) == Some("online")
+            })
+        })
+}
+
+fn controller_environment_value(path: &Path, key: &str) -> Result<Option<String>, String> {
+    if let Ok(value) = std::env::var(key) {
+        if !value.trim().is_empty() {
+            return Ok(Some(value));
+        }
+    }
+    if !path.exists() {
+        return Ok(None);
+    }
+    super::read_env_file_value(path, key)
+}
+
+fn tunnel_credentials_present(environment_file: &Path) -> Result<bool, String> {
+    let tunnel_id = controller_environment_value(environment_file, "CONTROL_PLANE_TUNNEL_ID")?;
+    let api_key = controller_environment_value(environment_file, "CONTROL_PLANE_API_KEY")?;
+    Ok(tunnel_id.is_some_and(|value| !value.trim().is_empty())
+        && api_key.is_some_and(|value| !value.trim().is_empty()))
+}
+
+fn remove_controller_tunnel_credentials(command: &mut Command) {
+    command
+        .env_remove("CONTROL_PLANE_TUNNEL_ID")
+        .env_remove("CONTROL_PLANE_API_KEY");
 }
 fn log_line(log: &Arc<Mutex<VecDeque<String>>>, source: &str, line: impl AsRef<str>) {
     let mut guard = log.lock().unwrap_or_else(|p| p.into_inner());
@@ -633,12 +647,16 @@ impl ControllerRuntime {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .kill_on_drop(true);
+                remove_controller_tunnel_credentials(&mut command);
                 self.server.process =
                     Some(spawn_process(command, "server", self.log.clone(), None)?);
                 self.wait_server_ready().await?;
                 self.server.phase = "ready";
             }
             Component::Runner => {
+                let view = runner_view(&self.config.runner.config)?;
+                let local_server_url = server_base_url(&self.config.server.env_file)?;
+                validate_runner_target(&view, &local_server_url)?;
                 self.stop_component(Component::Runner).await;
                 self.runner.phase = "starting";
                 let bin = super::discover_internal_binary("webcodex-runner").ok_or_else(|| {
@@ -653,9 +671,10 @@ impl ControllerRuntime {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .kill_on_drop(true);
+                remove_controller_tunnel_credentials(&mut command);
                 self.runner.process =
                     Some(spawn_process(command, "runner", self.log.clone(), None)?);
-                self.wait_runner_ready().await?;
+                self.wait_runner_ready(&view, &local_server_url).await?;
                 self.runner.phase = "ready";
             }
             Component::Tunnel => {
@@ -727,6 +746,19 @@ impl ControllerRuntime {
         self.stop_component(Component::Server).await;
     }
     async fn restart_component(&mut self, component: Option<Component>) -> Result<(), String> {
+        if let Some(component) = component {
+            let enabled = match component {
+                Component::Server => self.server.enabled,
+                Component::Runner => self.runner.enabled,
+                Component::Tunnel => self.tunnel.enabled,
+            };
+            if !enabled {
+                return Err(format!(
+                    "{} is disabled by Controller config",
+                    component.as_str()
+                ));
+            }
+        }
         match component {
             None | Some(Component::Server) => {
                 self.stop_component(Component::Tunnel).await;
@@ -743,20 +775,14 @@ impl ControllerRuntime {
         let token = server_token(&self.config.server.env_file)?;
         wait_runtime_status(&base, token.as_deref(), |_| true).await
     }
-    async fn wait_runner_ready(&self) -> Result<(), String> {
-        let view = runner_view(&self.config.runner.config)?;
+    async fn wait_runner_ready(
+        &self,
+        view: &RunnerConfigView,
+        local_server_url: &str,
+    ) -> Result<(), String> {
         let token = server_token(&self.config.server.env_file)?;
-        wait_runtime_status(&view.server_url, token.as_deref(), |output| {
-            output
-                .pointer("/agents/summary/clients")
-                .and_then(Value::as_array)
-                .is_some_and(|items| {
-                    items.iter().any(|item| {
-                        item.get("client_id").and_then(Value::as_str)
-                            == Some(view.client_id.as_str())
-                            && item.get("status").and_then(Value::as_str) == Some("online")
-                    })
-                })
+        wait_runtime_status(local_server_url, token.as_deref(), |output| {
+            runtime_has_online_runner(output, &view.client_id)
         })
         .await
     }
@@ -846,7 +872,7 @@ fn render_default_config() -> Result<String, String> {
     })
     .map_err(|e| e.to_string())
 }
-fn doctor_report(config: &ControllerConfig) -> Value {
+fn doctor_report(config: &ControllerConfig, environment_file: &Path) -> Result<Value, String> {
     let server_env = config.server.env_file.is_file();
     let runner_config = config.runner.config.is_file();
     let server_url = server_env
@@ -854,28 +880,96 @@ fn doctor_report(config: &ControllerConfig) -> Value {
         .flatten();
     let server_bin = super::discover_internal_binary("webcodex-server").is_some();
     let runner_bin = super::discover_internal_binary("webcodex-runner").is_some();
-    let tunnel_credentials = !config.tunnel.enabled
-        || (std::env::var("CONTROL_PLANE_TUNNEL_ID")
-            .ok()
-            .is_some_and(|v| !v.trim().is_empty())
-            && (std::env::var("CONTROL_PLANE_API_KEY")
-                .ok()
-                .is_some_and(|v| !v.trim().is_empty())
-                || std::env::var("OPENAI_TUNNEL_TOKEN")
-                    .ok()
-                    .is_some_and(|v| !v.trim().is_empty())));
+    let runner_server_matches_controller = if !config.runner.enabled {
+        Some(true)
+    } else if runner_config {
+        runner_view(&config.runner.config).ok().and_then(|view| {
+            server_url
+                .as_deref()
+                .map(|local| same_server_origin(&view.server_url, local))
+        })
+    } else {
+        None
+    };
+    let tunnel_credentials =
+        !config.tunnel.enabled || tunnel_credentials_present(environment_file)?;
     let service_conflicts = existing_service_conflicts(config);
     let ok = (!config.server.enabled || (server_env && server_url.is_some() && server_bin))
-        && (!config.runner.enabled || (runner_config && runner_bin))
+        && (!config.runner.enabled
+            || (runner_config && runner_bin && runner_server_matches_controller == Some(true)))
         && tunnel_credentials
         && service_conflicts.is_empty();
-    json!({
+    Ok(json!({
         "ok": ok,
         "server": {"enabled":config.server.enabled,"env_file":server_env,"loopback_url":server_url,"binary":server_bin},
-        "runner": {"enabled":config.runner.enabled,"config_file":runner_config,"binary":runner_bin},
-        "tunnel": {"enabled":config.tunnel.enabled,"provider":config.tunnel.provider,"credentials_present":tunnel_credentials},
+        "runner": {
+            "enabled":config.runner.enabled,
+            "config_file":runner_config,
+            "binary":runner_bin,
+            "server_matches_controller":runner_server_matches_controller
+        },
+        "tunnel": {
+            "enabled":config.tunnel.enabled,
+            "provider":config.tunnel.provider,
+            "credentials_present":tunnel_credentials,
+            "environment_file": environment_file.is_file()
+        },
         "existing_service_conflicts": service_conflicts
-    })
+    }))
+}
+
+#[cfg(unix)]
+fn prepare_runtime_dir(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    if !path.exists() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder
+            .create(path)
+            .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("failed to inspect {}: {e}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "Controller runtime path {} must be a real directory",
+            path.display()
+        ));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(format!(
+            "Controller runtime directory {} is not owned by the current user",
+            path.display()
+        ));
+    }
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err(format!(
+            "Controller runtime directory {} must not be writable by group or others",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_stale_controller_socket(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| {
+        format!(
+            "failed to inspect stale Controller socket {}: {e}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_socket() {
+        return Err(format!(
+            "refusing to remove non-socket Controller path {}",
+            path.display()
+        ));
+    }
+    std::fs::remove_file(path)
+        .map_err(|e| format!("failed to remove stale socket {}: {e}", path.display()))
 }
 
 #[cfg(unix)]
@@ -942,10 +1036,13 @@ async fn run_controller(config_path: &Path) -> Result<(), String> {
     let config = read_config(config_path)?;
     reject_existing_service_conflicts(&config)?;
     let socket = controller_socket(&config)?;
-    if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-    }
+    let runtime_dir = socket.parent().ok_or_else(|| {
+        format!(
+            "Controller socket {} has no parent directory",
+            socket.display()
+        )
+    })?;
+    prepare_runtime_dir(runtime_dir)?;
     if socket.exists() {
         if UnixStream::connect(&socket).await.is_ok() {
             return Err(format!(
@@ -953,11 +1050,15 @@ async fn run_controller(config_path: &Path) -> Result<(), String> {
                 socket.display()
             ));
         }
-        std::fs::remove_file(&socket)
-            .map_err(|e| format!("failed to remove stale socket {}: {e}", socket.display()))?;
+        remove_stale_controller_socket(&socket)?;
     }
     let listener = UnixListener::bind(&socket)
         .map_err(|e| format!("failed to bind {}: {e}", socket.display()))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("failed to secure {}: {e}", socket.display()))?;
+    }
     let mut runtime = ControllerRuntime::new(config);
     log_line(&runtime.log, "controller", "starting");
     if let Err(error) = runtime.start_all().await {
@@ -1055,9 +1156,16 @@ pub(crate) fn parse_controller_command(args: &[String]) -> Result<ControllerComm
             overwrite,
             no_start,
         }),
-        "start" => Ok(ControllerCommand::Start { service_file }),
+        "start" => Ok(ControllerCommand::Start {
+            config,
+            service_file,
+        }),
         "status" => Ok(ControllerCommand::Status { config, json }),
-        "doctor" => Ok(ControllerCommand::Doctor { config, json }),
+        "doctor" => Ok(ControllerCommand::Doctor {
+            config,
+            environment_file,
+            json,
+        }),
         "stop" => Ok(ControllerCommand::Stop { service_file }),
         "restart" => Ok(ControllerCommand::Restart {
             config,
@@ -1094,10 +1202,11 @@ pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result
         }
         ControllerCommand::Doctor {
             config,
+            environment_file,
             json: as_json,
         } => {
             let cfg = read_config(&config)?;
-            let report = doctor_report(&cfg);
+            let report = doctor_report(&cfg, &environment_file)?;
             if as_json {
                 return serde_json::to_string_pretty(&report).map_err(|e| e.to_string());
             }
@@ -1121,6 +1230,7 @@ pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result
                     "disabled"
                 } else if report["runner"]["config_file"].as_bool() == Some(true)
                     && report["runner"]["binary"].as_bool() == Some(true)
+                    && report["runner"]["server_matches_controller"].as_bool() == Some(true)
                 {
                     "ok"
                 } else {
@@ -1160,7 +1270,12 @@ pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result
             overwrite,
             no_start,
         ),
-        ControllerCommand::Start { service_file } => {
+        ControllerCommand::Start {
+            config,
+            service_file,
+        } => {
+            let cfg = read_config(&config)?;
+            reject_existing_service_conflicts(&cfg)?;
             control_controller_service(&service_file, super::ServiceControl::Start)
         }
         ControllerCommand::Status {
@@ -1199,6 +1314,8 @@ pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result
             component,
         } => {
             if component.is_none() {
+                let cfg = read_config(&config)?;
+                reject_existing_service_conflicts(&cfg)?;
                 return control_controller_service(&service_file, super::ServiceControl::Restart);
             }
             let cfg = read_config(&config)?;
@@ -1326,5 +1443,157 @@ mod tests {
         assert!(validate_config(&cfg)
             .unwrap_err()
             .contains("server.enabled=true"));
+    }
+
+    #[test]
+    fn runner_readiness_uses_canonical_runner_projection_only() {
+        let canonical = json!({
+            "runners": {
+                "clients": [{
+                    "client_id": "special",
+                    "status": "online"
+                }]
+            }
+        });
+        assert!(runtime_has_online_runner(&canonical, "special"));
+
+        let legacy = json!({
+            "agents": {
+                "summary": {
+                    "clients": [{
+                        "client_id": "special",
+                        "status": "online"
+                    }]
+                }
+            }
+        });
+        assert!(!runtime_has_online_runner(&legacy, "special"));
+    }
+
+    #[test]
+    fn runner_target_must_match_controller_local_server() {
+        let matching = RunnerConfigView {
+            server_url: "http://127.0.0.1:8080/".into(),
+            client_id: "special".into(),
+        };
+        validate_runner_target(&matching, "http://127.0.0.1:8080").unwrap();
+
+        let remote = RunnerConfigView {
+            server_url: "https://runtime.example.test".into(),
+            client_id: "special".into(),
+        };
+        assert!(validate_runner_target(&remote, "http://127.0.0.1:8080")
+            .unwrap_err()
+            .contains("does not match"));
+    }
+
+    #[test]
+    fn doctor_parser_preserves_controller_environment_file() {
+        let cmd = parse_controller_command(&[
+            "doctor".into(),
+            "--config".into(),
+            "/tmp/controller.toml".into(),
+            "--environment-file".into(),
+            "/tmp/controller.env".into(),
+            "--json".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd,
+            ControllerCommand::Doctor {
+                config: PathBuf::from("/tmp/controller.toml"),
+                environment_file: PathBuf::from("/tmp/controller.env"),
+                json: true,
+            }
+        );
+    }
+
+    #[test]
+    fn start_parser_preserves_config_for_conflict_preflight() {
+        let cmd = parse_controller_command(&[
+            "start".into(),
+            "--config".into(),
+            "/tmp/controller.toml".into(),
+            "--service-file".into(),
+            "/tmp/webcodex-controller.service".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd,
+            ControllerCommand::Start {
+                config: PathBuf::from("/tmp/controller.toml"),
+                service_file: PathBuf::from("/tmp/webcodex-controller.service"),
+            }
+        );
+    }
+
+    #[test]
+    fn server_and_runner_children_drop_tunnel_control_credentials() {
+        let mut command = Command::new("webcodex-child");
+        command
+            .env("CONTROL_PLANE_TUNNEL_ID", "tunnel_fixture")
+            .env("CONTROL_PLANE_API_KEY", "secret-fixture");
+        remove_controller_tunnel_credentials(&mut command);
+        let env = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|value| value.to_string_lossy().to_string()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(env.get("CONTROL_PLANE_TUNNEL_ID"), Some(&None));
+        assert_eq!(env.get("CONTROL_PLANE_API_KEY"), Some(&None));
+    }
+
+    #[tokio::test]
+    async fn component_restart_rejects_disabled_component() {
+        let cfg = ControllerConfig {
+            version: 1,
+            controller: ControllerSettings::default(),
+            server: ServerSettings {
+                enabled: false,
+                env_file: PathBuf::new(),
+            },
+            runner: RunnerSettings {
+                enabled: false,
+                config: PathBuf::new(),
+            },
+            tunnel: TunnelSettings::default(),
+        };
+        let mut runtime = ControllerRuntime::new(cfg);
+        assert!(runtime
+            .restart_component(Some(Component::Tunnel))
+            .await
+            .unwrap_err()
+            .contains("disabled"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_dir_rejects_group_or_world_writable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(prepare_runtime_dir(&runtime)
+            .unwrap_err()
+            .contains("must not be writable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_controller_path_must_be_a_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("controller.sock");
+        std::fs::write(&path, b"not a socket").unwrap();
+        assert!(remove_stale_controller_socket(&path)
+            .unwrap_err()
+            .contains("non-socket"));
+        assert!(path.exists());
     }
 }

@@ -144,9 +144,9 @@ Common operations:
     webcodex controller logs --lines 100
     webcodex controller stop
 
-V0 uses the local Server as the dependency root, so enabling Runner or Tunnel also requires Server to be enabled. The Controller refuses to take ownership when the existing webcodex.service, webcodex.socket, or webcodex-runner.service is already active, avoiding duplicate process ownership.
+V0 uses the local Server as the dependency root, so enabling Runner or Tunnel also requires Server to be enabled. The configured Runner `server_url` must match that Controller-managed loopback Server; remote Server topology is rejected before the Runner starts or any local Server credential is used. The Controller refuses to take ownership when the existing webcodex.service, webcodex.socket, or webcodex-runner.service is already active, avoiding duplicate process ownership.
 
-`controller install` installs a user service at `~/.config/systemd/user/webcodex-controller.service` by default and manages the Controller lifecycle through `systemctl --user`. The optional service environment file defaults to `~/.config/webcodex/controller.env`; when OpenAI Tunnel is enabled for background startup, `CONTROL_PLANE_TUNNEL_ID` and `CONTROL_PLANE_API_KEY` can be placed there. The Controller service does not install separate Server/Runner services; those lower-level processes remain children owned by the Controller.
+`controller install` installs a user service at `~/.config/systemd/user/webcodex-controller.service` by default and manages the Controller lifecycle through `systemctl --user`. The optional service environment file defaults to `~/.config/webcodex/controller.env`; when OpenAI Tunnel is enabled for background startup, `CONTROL_PLANE_TUNNEL_ID` and `CONTROL_PLANE_API_KEY` can be placed there. `controller doctor` checks those same two credentials from the process environment or the selected `--environment-file`. Tunnel control-plane credentials are not inherited by the managed Server or Runner children. The Controller service does not install separate Server/Runner services; those lower-level processes remain children owned by the Controller.
 
 On Windows, `server init`, foreground `server run`, and explicit `share` are supported. The managed service lifecycle (`install`, `start`, `stop`, `restart`, `logs`, `uninstall`) remains Linux-only.
 
