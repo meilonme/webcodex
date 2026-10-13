@@ -147,9 +147,9 @@ detached-process 行为。
 | `webcodex server logs` | 读取 Server service journal |
 | `webcodex server uninstall` | stop/disable/remove 受管 socket/service pair |
 
-## Controller（WSL/Linux 初版）
+## Controller（CLI 管理工具）
 
-webcodex controller 是 WSL/Linux 场景下的终端控制平面。V0 不修改 Desktop，也不改变 Server、Runner 或 OpenAI Tunnel 的下层运行契约。Server 可配置为本地托管或远程观察；Runner 仍在本机由 Controller 托管；OpenAI Tunnel 只适用于本地 Server。
+webcodex controller 是 WSL/Linux/Unix 场景下的 CLI 管理工具，提供命令行和只读 TUI 概览入口，沿用 Server、Runner 和 OpenAI Tunnel 的现有运行契约。Server 可配置为本地托管或远程观察；Runner 仍在本机由 Controller 托管；OpenAI Tunnel 只适用于本地 Server。
 
     webcodex controller init
     webcodex controller doctor
@@ -166,8 +166,18 @@ webcodex controller 是 WSL/Linux 场景下的终端控制平面。V0 不修改 
     webcodex controller restart runner
     webcodex controller restart tunnel
     webcodex controller logs --lines 100
+    webcodex controller logs -f
     webcodex controller stop
     webcodex controller uninstall --confirm
+
+只读终端概览：
+
+    webcodex controller tui
+    webcodex controller tui --config /path/to/controller.toml --service-file /path/to/controller.service --user-token-file /path/to/user-token
+
+界面展示 Controller 来源与运行状态、systemd 服务状态、Server/Runner/Tunnel 的状态、PID 和重启次数，项目 ID、路径、库存同步状态和截断提示，下方持续显示实时日志。状态每 2 秒刷新，项目每 10 秒刷新；不可访问时显示具体错误，并将保留的旧数据标记为过期。项目查询沿用已有凭据选择及在线 Runner 检查。TUI 要求交互式 stdin/stdout 和至少 80×24 的终端，仅提供观察功能，进入或退出均不改变 Controller、服务或项目状态。
+
+Tab 切换项目/日志焦点，方向键及 PageUp/PageDown 滚动，Space 暂停/恢复日志自动滚动，`r` 刷新状态和项目，`q` 或 Ctrl+C 退出。日志首次读取 100 行，缓存最多 500 行和 1 MiB；缓存淘汰、连接断开及输出超限均明确提示。断开后每 2 秒重连；运行中的旧 Controller 不支持日志跟随时提示更新并停止重连。退出会清理 TUI 的查询与日志观察进程并恢复终端。
 
 项目管理：
 
@@ -177,7 +187,7 @@ webcodex controller 是 WSL/Linux 场景下的终端控制平面。V0 不修改 
 
 Controller 的 [server] 支持 mode = "local" 与 mode = "remote"。local 模式要求 env_file，Controller 会启动并监督 webcodex-server；remote 模式要求 url，Controller 只探测远程 Server，不启动本地 Server，也禁止本地 regular Tunnel。两种模式下 Runner 都使用本机 runner.toml，且其中的 server_url 必须与 Controller 配置的 Server 一致。Controller 不接管已经由 webcodex.service / webcodex.socket / webcodex-runner.service 管理的同类本地实例。
 
-`controller install` 默认安装 user service 到 `~/.config/systemd/user/webcodex-controller.service`，并通过 `systemctl --user` 管理 Controller 生命周期。`status` 会优先读取正在运行的 Controller Unix Socket，并同时显示 systemd 状态；Socket 不可用时仍可显示已安装 service 状态。`logs` 优先读取 Controller 内存中的组件日志，Controller 不可达时回退到 user journal。`stop` 会自动识别前台 Controller 与 systemd service；无组件参数的 `restart` 优先重启已安装 service，否则重启前台 runtime。`restart server|runner|tunnel` 始终通过 Controller IPC 操作组件。`uninstall --confirm` 只删除 Controller unit，不删除 controller.toml 或 controller.env。
+`controller install` 默认安装 user service 到 `~/.config/systemd/user/webcodex-controller.service`，并通过 `systemctl --user` 管理 Controller 生命周期。`status` 会优先读取正在运行的 Controller Unix Socket，并同时显示 systemd 状态；Socket 不可用时仍可显示已安装 service 状态。`logs` 优先读取 Controller 内存中的组件日志，Controller 不可达时回退到 user journal。添加 `-f` 或 `--follow` 可先输出最近日志，再持续读取新增日志，按 Ctrl+C 退出；`--lines N` 控制首次读取的行数。内存日志跟随连接断开或读取速度落后时会明确报错，可重新运行命令读取最新日志。`stop` 会自动识别前台 Controller 与 systemd service；无组件参数的 `restart` 优先重启已安装 service，否则重启前台 runtime。`restart server|runner|tunnel` 始终通过 Controller IPC 操作组件。`uninstall --confirm` 只删除 Controller unit，不删除 controller.toml 或 controller.env。
 
 所有 `controller project` 命令均要求 `runner.enabled=true`，且指定 Runner 在 Server 上在线并对当前凭据可见；Controller 守护进程本身不必运行。Runner 离线、目标不可访问或版本不支持时明确报错，不回退本地 registry，也不自动启动 Runner。
 

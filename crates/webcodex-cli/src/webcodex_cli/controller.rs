@@ -10,16 +10,20 @@ use std::sync::{Arc, Mutex};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 #[cfg(unix)]
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 #[cfg(any(unix, test))]
 use tokio::process::Command;
 #[cfg(unix)]
 use tokio::process::{Child, ChildStdin};
 #[cfg(unix)]
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 #[path = "controller_projects.rs"]
 mod projects;
+
+#[cfg(unix)]
+#[path = "controller_tui.rs"]
+mod tui;
 
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
@@ -28,10 +32,17 @@ use tokio::net::{UnixListener, UnixStream};
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
 const LOG_LIMIT: usize = 500;
+#[cfg(unix)]
+const LOG_FOLLOWER_LIMIT: usize = 16;
 const CONTROLLER_SERVICE_UNIT: &str = "webcodex-controller.service";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControllerCommand {
+    Tui {
+        config: PathBuf,
+        service_file: PathBuf,
+        user_token_file: Option<PathBuf>,
+    },
     Init {
         config: PathBuf,
         overwrite: bool,
@@ -73,6 +84,7 @@ pub(crate) enum ControllerCommand {
         config: PathBuf,
         service_file: PathBuf,
         lines: usize,
+        follow: bool,
     },
     Uninstall {
         service_file: PathBuf,
@@ -274,7 +286,8 @@ struct ControllerRuntime {
     server: RuntimeComponent,
     runner: RuntimeComponent,
     tunnel: RuntimeComponent,
-    log: Arc<Mutex<VecDeque<String>>>,
+    log: Arc<Mutex<ControllerLog>>,
+    log_followers: tokio::task::JoinSet<()>,
     shutdown: bool,
     tunnel_ready_rx: Option<watch::Receiver<bool>>,
 }
@@ -383,6 +396,8 @@ struct IpcRequest {
     component: Option<Component>,
     #[serde(default)]
     lines: Option<usize>,
+    #[serde(default)]
+    follow: bool,
 }
 
 pub(crate) fn default_controller_config_path() -> Result<PathBuf, String> {
@@ -587,7 +602,7 @@ fn validate_config(cfg: &ControllerConfig) -> Result<(), String> {
         return Err("runner.config is required when runner.enabled=true".to_string());
     }
     if cfg.tunnel.enabled && cfg.tunnel.provider != "openai" {
-        return Err("Controller V0 supports only tunnel.provider=\"openai\"".to_string());
+        return Err("Controller supports only tunnel.provider=\"openai\"".to_string());
     }
     if cfg.controller.max_restart_attempts == 0 {
         return Err("controller.max_restart_attempts must be greater than zero".to_string());
@@ -749,18 +764,34 @@ fn remove_controller_tunnel_credentials(command: &mut Command) {
         .env_remove("CONTROL_PLANE_API_KEY");
 }
 #[cfg(unix)]
-fn log_line(log: &Arc<Mutex<VecDeque<String>>>, source: &str, line: impl AsRef<str>) {
-    let mut guard = log.lock().unwrap_or_else(|p| p.into_inner());
-    guard.push_back(format!("[{source}] {}", line.as_ref()));
-    while guard.len() > LOG_LIMIT {
-        guard.pop_front();
+struct ControllerLog {
+    lines: VecDeque<String>,
+    updates: broadcast::Sender<String>,
+}
+#[cfg(unix)]
+impl ControllerLog {
+    fn new() -> Self {
+        Self {
+            lines: VecDeque::new(),
+            updates: broadcast::channel(LOG_LIMIT).0,
+        }
     }
+}
+#[cfg(unix)]
+fn log_line(log: &Arc<Mutex<ControllerLog>>, source: &str, line: impl AsRef<str>) {
+    let mut guard = log.lock().unwrap_or_else(|p| p.into_inner());
+    let line = format!("[{source}] {}", line.as_ref());
+    guard.lines.push_back(line.clone());
+    while guard.lines.len() > LOG_LIMIT {
+        guard.lines.pop_front();
+    }
+    let _ = guard.updates.send(line);
 }
 #[cfg(unix)]
 fn spawn_log_reader<R>(
     reader: R,
     source: &'static str,
-    log: Arc<Mutex<VecDeque<String>>>,
+    log: Arc<Mutex<ControllerLog>>,
     tunnel_tx: Option<watch::Sender<bool>>,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -787,7 +818,7 @@ fn spawn_log_reader<R>(
 fn spawn_process(
     mut command: Command,
     source: &'static str,
-    log: Arc<Mutex<VecDeque<String>>>,
+    log: Arc<Mutex<ControllerLog>>,
     tunnel_tx: Option<watch::Sender<bool>>,
 ) -> Result<ManagedProcess, String> {
     let mut child = command
@@ -874,7 +905,8 @@ impl ControllerRuntime {
             runner: RuntimeComponent::new(config.runner.enabled),
             tunnel: RuntimeComponent::new(config.tunnel.enabled),
             config,
-            log: Arc::new(Mutex::new(VecDeque::new())),
+            log: Arc::new(Mutex::new(ControllerLog::new())),
+            log_followers: tokio::task::JoinSet::new(),
             shutdown: false,
             tunnel_ready_rx: None,
         }
@@ -1334,13 +1366,101 @@ async fn ipc_call(socket: &Path, request: Value) -> Result<Value, String> {
     serde_json::from_str(&line).map_err(|e| format!("invalid Controller response: {e}"))
 }
 #[cfg(unix)]
+async fn write_log_response<W: tokio::io::AsyncWrite + Unpin>(
+    write: &mut W,
+    value: Value,
+) -> Result<(), String> {
+    let mut bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
+    bytes.push(b'\n');
+    write.write_all(&bytes).await.map_err(|e| e.to_string())
+}
+
+#[cfg(unix)]
+async fn stream_log_updates<W: tokio::io::AsyncWrite + Unpin>(
+    write: &mut W,
+    initial: Vec<String>,
+    mut updates: broadcast::Receiver<String>,
+) -> Result<(), String> {
+    write_log_response(
+        write,
+        json!({"ok":true,"result":{"lines":initial,"following":true}}),
+    )
+    .await?;
+    loop {
+        match updates.recv().await {
+            Ok(line) => {
+                write_log_response(write, json!({"ok":true,"result":{"lines":[line]}})).await?;
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                return write_log_response(
+                    write,
+                    json!({"ok":false,"error":"Controller log follower fell behind; rerun controller logs -f to read the latest logs"}),
+                )
+                .await;
+            }
+            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn follow_controller_logs<W: tokio::io::AsyncWrite + Unpin>(
+    mut stream: UnixStream,
+    lines: usize,
+    output: &mut W,
+) -> Result<(), String> {
+    write_log_response(
+        &mut stream,
+        json!({"method":"logs","lines":lines,"follow":true}),
+    )
+    .await?;
+    let mut reader = BufReader::new(stream);
+    let mut first = true;
+    loop {
+        let mut line = String::new();
+        if reader
+            .read_line(&mut line)
+            .await
+            .map_err(|e| e.to_string())?
+            == 0
+        {
+            return Err("Controller log stream disconnected; rerun controller logs -f after the Controller is available".to_string());
+        }
+        let value: Value = serde_json::from_str(&line)
+            .map_err(|e| format!("invalid Controller log response: {e}"))?;
+        if value["ok"] != true {
+            return Err(value["error"]
+                .as_str()
+                .unwrap_or("Controller log request failed")
+                .to_string());
+        }
+        if first && value["result"]["following"] != true {
+            return Err("The running Controller does not support log following; restart it with the updated binary".to_string());
+        }
+        first = false;
+        let items = value["result"]["lines"]
+            .as_array()
+            .ok_or_else(|| "invalid Controller log response: missing lines".to_string())?;
+        for item in items {
+            let line = item
+                .as_str()
+                .ok_or_else(|| "invalid Controller log response: expected a string".to_string())?;
+            output
+                .write_all(line.as_bytes())
+                .await
+                .map_err(|e| e.to_string())?;
+            output.write_all(b"\n").await.map_err(|e| e.to_string())?;
+        }
+        output.flush().await.map_err(|e| e.to_string())?;
+    }
+}
+
+#[cfg(unix)]
 async fn handle_ipc(runtime: &mut ControllerRuntime, stream: UnixStream) -> Result<(), String> {
     let (read, mut write) = stream.into_split();
     let mut line = String::new();
-    BufReader::new(read)
-        .read_line(&mut line)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut read = BufReader::new(read);
+    read.read_line(&mut line).await.map_err(|e| e.to_string())?;
     let req: IpcRequest =
         serde_json::from_str(&line).map_err(|e| format!("invalid Controller request: {e}"))?;
     let result = match req.method.as_str() {
@@ -1355,9 +1475,32 @@ async fn handle_ipc(runtime: &mut ControllerRuntime, stream: UnixStream) -> Resu
         }
         "logs" => {
             let lines = req.lines.unwrap_or(100).min(LOG_LIMIT);
-            let guard = runtime.log.lock().unwrap_or_else(|p| p.into_inner());
-            let mut items: Vec<_> = guard.iter().rev().take(lines).cloned().collect();
-            items.reverse();
+            // Subscribe while holding the same lock as log_line so the tail/update
+            // boundary cannot duplicate or lose an entry.
+            let (items, updates) = {
+                let guard = runtime.log.lock().unwrap_or_else(|p| p.into_inner());
+                let mut items: Vec<_> = guard.lines.iter().rev().take(lines).cloned().collect();
+                items.reverse();
+                (items, req.follow.then(|| guard.updates.subscribe()))
+            };
+            if let Some(updates) = updates {
+                while runtime.log_followers.try_join_next().is_some() {}
+                if runtime.log_followers.len() >= LOG_FOLLOWER_LIMIT {
+                    write_log_response(
+                        &mut write,
+                        json!({"ok":false,"error":"Controller log follower limit reached"}),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                runtime.log_followers.spawn(async move {
+                    tokio::select! {
+                        _ = read.read_u8() => {},
+                        _ = stream_log_updates(&mut write, items, updates) => {},
+                    }
+                });
+                return Ok(());
+            }
             json!({"lines":items})
         }
         other => return Err(format!("unknown Controller method: {other}")),
@@ -1426,9 +1569,41 @@ async fn run_controller(config_path: &Path) -> Result<(), String> {
             break;
         }
     }
+    runtime.log_followers.abort_all();
     runtime.stop_all().await;
     let _ = std::fs::remove_file(&socket);
     Ok(())
+}
+
+fn parse_controller_tui_command(args: &[String]) -> Result<ControllerCommand, String> {
+    let mut config = None;
+    let mut service_file = None;
+    let mut user_token_file = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-h" | "--help" => return Err(super::controller_usage().to_string()),
+            "--config" | "--service-file" | "--user-token-file" => {
+                let value =
+                    PathBuf::from(iter.next().ok_or_else(|| format!("{arg} requires PATH"))?);
+                match arg.as_str() {
+                    "--config" => config = Some(value),
+                    "--service-file" => service_file = Some(value),
+                    _ => user_token_file = Some(value),
+                }
+            }
+            other => return Err(format!("unknown controller tui option: {other}")),
+        }
+    }
+    Ok(ControllerCommand::Tui {
+        config: config
+            .map(Ok)
+            .unwrap_or_else(default_controller_config_path)?,
+        service_file: service_file
+            .map(Ok)
+            .unwrap_or_else(default_controller_service_file)?,
+        user_token_file,
+    })
 }
 
 pub(crate) fn parse_controller_command(args: &[String]) -> Result<ControllerCommand, String> {
@@ -1441,6 +1616,9 @@ pub(crate) fn parse_controller_command(args: &[String]) -> Result<ControllerComm
     if command == "project" {
         return parse_controller_project_command(&args[1..]);
     }
+    if command == "tui" {
+        return parse_controller_tui_command(&args[1..]);
+    }
     let mut config = None;
     let mut environment_file = None;
     let mut service_file = None;
@@ -1450,6 +1628,7 @@ pub(crate) fn parse_controller_command(args: &[String]) -> Result<ControllerComm
     let mut json = false;
     let mut component = None;
     let mut lines = 100usize;
+    let mut follow = false;
     let mut iter = args[1..].iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1475,6 +1654,7 @@ pub(crate) fn parse_controller_command(args: &[String]) -> Result<ControllerComm
             "--no-start" => no_start = true,
             "--confirm" => confirm = true,
             "--json" => json = true,
+            "-f" | "--follow" if command == "logs" => follow = true,
             "--lines" => {
                 lines = iter
                     .next()
@@ -1551,6 +1731,7 @@ pub(crate) fn parse_controller_command(args: &[String]) -> Result<ControllerComm
             config: resolve_config()?,
             service_file: resolve_service_file()?,
             lines,
+            follow,
         }),
         "uninstall" => Ok(ControllerCommand::Uninstall {
             service_file: resolve_service_file()?,
@@ -1565,6 +1746,25 @@ pub(crate) fn parse_controller_command(args: &[String]) -> Result<ControllerComm
 
 pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result<String, String> {
     match command {
+        ControllerCommand::Tui {
+            config,
+            service_file,
+            user_token_file,
+        } => {
+            #[cfg(unix)]
+            {
+                tui::run(config, service_file, user_token_file).await?;
+                Ok(String::new())
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (config, service_file, user_token_file);
+                Err(
+                    "webcodex controller tui is currently supported only on WSL/Linux/Unix"
+                        .to_string(),
+                )
+            }
+        }
         ControllerCommand::Init { config, overwrite } => {
             if config.exists() && !overwrite {
                 return Err(format!(
@@ -1802,12 +2002,22 @@ pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result
             config,
             service_file,
             lines,
+            follow,
         } => {
             #[cfg(unix)]
             {
                 if let Ok(cfg) = read_config(&config) {
                     let socket = controller_socket(&cfg)?;
-                    if let Ok(value) =
+                    if follow {
+                        if let Ok(stream) = UnixStream::connect(&socket).await {
+                            let mut stdout = tokio::io::stdout();
+                            tokio::select! {
+                                result = follow_controller_logs(stream, lines, &mut stdout) => result?,
+                                result = tokio::signal::ctrl_c() => result.map_err(|e| format!("failed to wait for Ctrl+C: {e}"))?,
+                            }
+                            return Ok(String::new());
+                        }
+                    } else if let Ok(value) =
                         ipc_call(&socket, json!({"method":"logs","lines":lines})).await
                     {
                         let mut out = String::new();
@@ -1832,7 +2042,7 @@ pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result
                         &unit,
                         lines.min(u32::MAX as usize) as u32,
                         None,
-                        false,
+                        follow,
                     );
                 }
                 Err(
@@ -1842,7 +2052,7 @@ pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result
             }
             #[cfg(not(unix))]
             {
-                let _ = (config, service_file, lines);
+                let _ = (config, service_file, lines, follow);
                 Err("webcodex controller is currently supported only on WSL/Linux/Unix".to_string())
             }
         }
@@ -1862,6 +2072,10 @@ pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/controller_logs.rs"]
+mod logs_tests;
 
 #[cfg(test)]
 mod tests {

@@ -206,9 +206,9 @@ keep their detached-process behavior when `--scope` is omitted.
 | `webcodex server logs` | Read the Server service journal |
 | `webcodex server uninstall` | Stop, disable, and remove the managed socket/service pair |
 
-## Controller (WSL/Linux V0)
+## Controller (CLI management tool)
 
-webcodex controller is the terminal control plane for WSL/Linux. V0 does not modify Desktop and does not change the lower-level Server, Runner, or OpenAI Tunnel process contracts. The Server may be locally managed or remotely observed; the Runner remains local and Controller-managed; the OpenAI Tunnel is available only for a local Server.
+webcodex controller is a CLI management tool for WSL/Linux/Unix, with command-line operations and a read-only TUI overview using the existing Server, Runner, and OpenAI Tunnel process contracts. The Server may be locally managed or remotely observed; the Runner remains local and Controller-managed; the OpenAI Tunnel is available only for a local Server.
 
     webcodex controller init
     webcodex controller doctor
@@ -225,8 +225,18 @@ Common operations:
     webcodex controller restart runner
     webcodex controller restart tunnel
     webcodex controller logs --lines 100
+    webcodex controller logs -f
     webcodex controller stop
     webcodex controller uninstall --confirm
+
+Read-only terminal overview:
+
+    webcodex controller tui
+    webcodex controller tui --config /path/to/controller.toml --service-file /path/to/controller.service --user-token-file /path/to/user-token
+
+The overview shows Controller source and runtime state, systemd service state, Server/Runner/Tunnel state, PID and restart count, project IDs and paths, inventory synchronization and truncation, and live logs below. Status refreshes every 2 seconds and projects every 10 seconds; unavailable queries show their errors and retained data is marked stale. Project queries use the existing credential selection and online Runner checks. The TUI requires interactive stdin/stdout and an 80×24 or larger terminal. Entering or exiting it does not change Controller, service, or project state.
+
+Tab switches project/log focus; arrows and PageUp/PageDown scroll; Space pauses/resumes automatic log scrolling; `r` refreshes status and projects; `q` or Ctrl+C exits. Logs start with 100 recent lines and retain at most 500 lines and 1 MiB; cache eviction, disconnection, and output limits are reported. Disconnections retry every 2 seconds; an older running Controller without log-follow support reports that an update is required and stops retrying. Exiting cleans up the TUI's query/log observation processes and restores the terminal.
 
 Project management:
 
@@ -236,7 +246,7 @@ Project management:
 
 The [server] section supports mode = "local" and mode = "remote". Local mode requires env_file and the Controller starts/supervises webcodex-server. Remote mode requires url; the Controller only probes that Server, does not start a local Server, and rejects a local regular Tunnel. In both modes the Runner uses the local runner.toml, whose server_url must match the Controller Server target. The Controller refuses duplicate ownership of existing local webcodex.service, webcodex.socket, or webcodex-runner.service instances.
 
-`controller install` installs a user service at `~/.config/systemd/user/webcodex-controller.service` by default and manages it through `systemctl --user`. `status` prefers the live Controller Unix Socket and also reports service state; if the socket is unavailable it still reports the installed service. `logs` prefers the Controller's bounded in-memory component logs and falls back to the user journal. `stop` automatically handles a foreground Controller or installed service. A component-less `restart` prefers an installed service and otherwise restarts the foreground runtime; `restart server|runner|tunnel` always uses Controller IPC. `uninstall --confirm` removes only the Controller unit and preserves controller.toml and controller.env.
+`controller install` installs a user service at `~/.config/systemd/user/webcodex-controller.service` by default and manages it through `systemctl --user`. `status` prefers the live Controller Unix Socket and also reports service state; if the socket is unavailable it still reports the installed service. `logs` prefers the Controller's bounded in-memory component logs and falls back to the user journal. Add `-f` or `--follow` to print the recent tail and keep reading new logs until Ctrl+C; `--lines N` controls the initial tail. If an in-memory follower disconnects or falls behind, it reports an error; rerun the command to read the latest logs. `stop` automatically handles a foreground Controller or installed service. A component-less `restart` prefers an installed service and otherwise restarts the foreground runtime; `restart server|runner|tunnel` always uses Controller IPC. `uninstall --confirm` removes only the Controller unit and preserves controller.toml and controller.env.
 
 All `controller project` commands require `runner.enabled=true` and the configured Runner to be online and visible through the Server. The Controller daemon itself need not be running. Offline, inaccessible, or unsupported targets fail explicitly; there is no local registry fallback or automatic Runner start.
 
