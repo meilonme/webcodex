@@ -321,6 +321,8 @@ pub(crate) fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabili
     // MCP gateway support is fenced by the validated provider inventory in
     // registration rather than a separate capability bit. Older binaries omit
     // that inventory, so a newer Server will never target them.
+    // ResourceLink is an independently negotiated additive Runner result variant.
+    capabilities.set(RunnerCapabilityId::McpGatewayResourceLinks, true);
     // `job_state_reconciliation` is on by default. A hidden, test/ops-only env
     // knob lets an E2E exercise the valid generation-2 no-reconciliation mode
     // (it then has no job inventory and a disconnect falls straight to `lost`).
