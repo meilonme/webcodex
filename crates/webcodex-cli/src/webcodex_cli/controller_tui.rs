@@ -599,14 +599,21 @@ fn draw(frame: &mut Frame, app: &mut Overview) {
             Row::new(["Component", "Status", "PID", "Restarts"])
                 .style(Style::default().fg(Color::Cyan)),
         )
-        .block(panel(
-            if app.status.error.is_some() {
-                "Components · stale"
-            } else {
-                "Components"
-            },
-            false,
-        )),
+        .block(
+            panel(
+                if app.status.error.is_some() {
+                    "Components · stale"
+                } else {
+                    "Components"
+                },
+                false,
+            )
+            .title_bottom(
+                super::runner_observation_text(runtime)
+                    .trim()
+                    .replace('\n', " · "),
+            ),
+        ),
         areas[1],
     );
     draw_projects(frame, app, areas[2]);

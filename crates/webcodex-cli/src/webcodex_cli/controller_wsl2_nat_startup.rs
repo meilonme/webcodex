@@ -85,7 +85,6 @@ pub(super) struct Wsl2NatStartup {
     task: Option<tokio::task::JoinHandle<Wsl2NatSnapshot>>,
     pub retry_at: Option<Instant>,
     retry_secs: u64,
-    pub started_at: Option<Instant>,
 }
 
 impl Default for Wsl2NatStartup {
@@ -95,7 +94,6 @@ impl Default for Wsl2NatStartup {
             task: None,
             retry_at: None,
             retry_secs: 3,
-            started_at: None,
         }
     }
 }
@@ -106,7 +104,6 @@ impl Wsl2NatStartup {
             task.abort();
         }
         self.retry_at = None;
-        self.started_at = None;
         self.snapshot = Wsl2NatSnapshot::default();
     }
 }
@@ -219,14 +216,6 @@ impl ControllerRuntime {
             return;
         }
         if self.runner.process.is_some() {
-            if self
-                .wsl2_startup
-                .started_at
-                .is_some_and(|at| at.elapsed() >= Duration::from_secs(3))
-            {
-                self.runner.phase = "running_unverified";
-                self.wsl2_startup.started_at = None;
-            }
             return; // Never rediscover or probe while a Runner is alive.
         }
         if self.wsl2_startup.snapshot.effective_url.is_none() {
@@ -319,7 +308,7 @@ pub(super) async fn active_target(config: &ControllerConfig) -> Result<Wsl2NatSn
         || state.probe_state != "reachable"
         || !matches!(
             response["result"]["runner"]["phase"].as_str(),
-            Some("starting" | "running_unverified" | "ready")
+            Some("starting" | "running_unverified" | "running_offline" | "ready")
         )
     {
         return Err("wsl2_nat_target_unresolved: Runner has no active target".into());
@@ -331,41 +320,17 @@ pub(super) async fn active_target(config: &ControllerConfig) -> Result<Wsl2NatSn
 }
 
 pub(super) async fn doctor(config: &ControllerConfig, report: &mut Value) -> Result<(), String> {
-    let connection = tokio::time::timeout(
-        Duration::from_secs(2),
-        UnixStream::connect(controller_socket(config)?),
-    )
-    .await
-    .map_err(|_| "controller_unavailable: connection timed out")?;
-    let state = match connection {
-        Ok(stream) => {
-            let response = tokio::time::timeout(
-                Duration::from_secs(2),
-                ipc_exchange(stream, json!({"method":"status"})),
-            )
-            .await
-            .map_err(|_| "controller_unavailable: live snapshot timed out")?
-            .map_err(|_| "controller_unavailable: invalid live snapshot")?;
-            if response["ok"] != true || response["result"]["server_mode"] != "wsl2_nat" {
-                return Err("controller_target_changed".into());
-            }
-            report["runtime"] = response["result"].clone();
-            serde_json::from_value::<Wsl2NatSnapshot>(response["result"]["wsl2_nat_target"].clone())
-                .map_err(|_| "invalid_controller_snapshot")?
-        }
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            let mut state = attempt(config.clone(), Binding::read(config)?).await;
-            state.source = "candidate".into();
-            state.generation = None;
-            state
-        }
-        Err(_) => return Err("controller_unavailable: cannot access the control socket".into()),
+    let runtime = runner_observation::live_snapshot(config).await?;
+    let state = if let Some(runtime) = &runtime {
+        serde_json::from_value::<Wsl2NatSnapshot>(runtime["wsl2_nat_target"].clone())
+            .map_err(|_| "invalid_controller_snapshot")?
+    } else {
+        let mut state = attempt(config.clone(), Binding::read(config)?).await;
+        state.source = "candidate".into();
+        state.generation = None;
+        state
     };
+    runner_observation::attach_runtime(report, runtime);
     let binding_matches = state.binding.as_ref() == Some(&Binding::read(config)?);
     report["server"]["url"] = json!(state.effective_url);
     report["runner"]["server_matches_controller"] = json!(binding_matches);

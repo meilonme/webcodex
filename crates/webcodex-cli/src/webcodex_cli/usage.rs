@@ -57,7 +57,7 @@ Commands:\n\
   uninstall  Stop/disable/remove only the Controller systemd user service (--confirm)\n\
   project    List, register, or unregister projects through an online Runner\n\n\
 Project commands: project list | project register PATH | project remove ID-OR-PATH\n\
-  --user-token-file PATH   User API credential [default: matching Runner connection's webcodex-user-token]\n\
+  --user-token-file PATH   User API credential [default: runner.user_token_file, matching connection, then Runner sibling]\n\
   All project commands require the configured Runner online; no local registry fallback.\n\n\
 Common options:\n\
   --config PATH   Controller config [default: ~/.config/webcodex/controller.toml]\n\

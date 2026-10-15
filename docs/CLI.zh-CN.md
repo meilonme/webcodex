@@ -187,6 +187,10 @@ Tab 切换项目/日志焦点，方向键及 PageUp/PageDown 滚动，Space 暂�
 
 Controller 的 [server] 支持 mode = "local"、mode = "remote" 与 mode = "wsl2_nat"。local 模式要求 env_file，Controller 会启动并监督 webcodex-server；remote 模式要求 url，Controller 只探测远程 Server，不启动本地 Server，也禁止本地 regular Tunnel。local/remote 模式下 Runner 都使用本机 runner.toml，且其中的 server_url 必须与 Controller 配置的 Server 一致。Controller 不接管已经由 webcodex.service / webcodex.socket / webcodex-runner.service 管理的同类本地实例。
 
+三种模式均由 Controller 守护进程使用用户 API 凭据持续查询指定 Runner 的在线状态：启动后立即查询，之后每 10 秒查询一次，单次超时 3 秒，响应上限 1 MiB。首次观测前为 `starting`；Server 确认在线后为 `ready`；明确非在线且进程存活时为 `running_offline`；凭据不可用、无权访问、不可见或查询失败时为 `running_unverified`。失败会立即撤销旧在线结论，超过 30 秒的观测也不再有效。观测不阻塞 IPC，不触发重启或 WSL 网关发现。停止或更换 Runner 进程会清空旧观测。
+
+TUI、`status` 和在线 `doctor` 共用守护进程状态；JSON 的 Runner 快照提供可选 `observed_at` 和 `observation_error`，文本和 TUI 同时展示观测时间及错误分类。`doctor` 将配置检查与运行状态分开；守护进程不可用时，Runner 在线状态为未知。项目命令仍自行检查在线状态，不使用展示缓存作为执行依据。
+
 `wsl2_nat` 专用于 WSL2 NAT 内的 Runner 自动连接 Windows 宿主机上的 Desktop Server，不考虑其他虚拟机或网络拓扑兼容。Controller 配置如下：
 
 ```toml
@@ -199,6 +203,8 @@ port = 8080       # 必填
 [runner]
 enabled = true
 config = "/home/user/.config/webcodex/clients/wsl2-runner/runner.toml"
+# 可选：显式指定用户 API 凭据；省略时自动查找
+# user_token_file = "/home/user/.config/webcodex/webcodex-user-token"
 
 [tunnel]
 enabled = false
@@ -210,13 +216,13 @@ enabled = false
 
 Controller 通过 `webcodex-runner --config PATH --server-url URL --stop-on-stdin-eof` 启动 Runner。独立 Runner 的 `--server-url` 与 `runner.toml` 的 `server_url` 含义和校验相同，命令行值在本次进程及热重载时始终优先；显式无效值直接报错，不回退配置值。配置文件、身份、凭据、项目注册目录及策略保持不变。Controller 使用子进程局部代理排除项，确保网关请求不经代理，不修改全局环境变量。
 
-`status --json` 的 `wsl2_nat_target` 报告当前目标、代次、配置绑定、采样时间及解析/探测错误。`doctor --json` 在线时使用活动快照，离线发现明确标记为 `candidate`。网络可达（包括 HTTP 401/403）不代表 Runner 已认证；子进程稳定后仍显示 `running_unverified`，直到受权 Server 查询证明在线。
+`status --json` 的 `wsl2_nat_target` 报告当前目标、代次、配置绑定、采样时间及解析/探测错误。`doctor --json` 在线时使用活动快照，离线发现明确标记为 `candidate`。网络可达（包括 HTTP 401/403）不代表 Runner 已认证；Runner 在线状态由上述授权查询持续维护。
 
 `controller install` 默认安装 user service 到 `~/.config/systemd/user/webcodex-controller.service`，并通过 `systemctl --user` 管理 Controller 生命周期。`status` 会优先读取正在运行的 Controller Unix Socket，并同时显示 systemd 状态；Socket 不可用时仍可显示已安装 service 状态。`logs` 优先读取 Controller 内存中的组件日志，Controller 不可达时回退到 user journal。添加 `-f` 或 `--follow` 可先输出最近日志，再持续读取新增日志，按 Ctrl+C 退出；`--lines N` 控制首次读取的行数。内存日志跟随连接断开或读取速度落后时会明确报错，可重新运行命令读取最新日志。`stop` 会自动识别前台 Controller 与 systemd service；无组件参数的 `restart` 优先重启已安装 service，否则重启前台 runtime。`restart server|runner|tunnel` 始终通过 Controller IPC 操作组件。`uninstall --confirm` 只删除 Controller unit，不删除 controller.toml 或 controller.env。
 
 所有 `controller project` 命令均要求 `runner.enabled=true`，且指定 Runner 在 Server 上在线并对当前凭据可见。local/remote 模式下 Controller 守护进程本身不必运行；`wsl2_nat` 模式要求守护进程在线，并具有与当前配置匹配的活动目标。项目操作使用固定的有效端点，每次请求前检查代次；Controller 不可用、目标未解析或代次改变时明确报错。Runner 离线、目标不可访问或版本不支持时明确报错，不回退本地 registry，也不自动启动 Runner。
 
-三个命令均支持 `--user-token-file PATH`。未指定时使用匹配 Server/Runner 连接的默认 `webcodex-user-token`，优先选择包含当前 Runner 配置文件的连接。默认连接缺失或存在歧义时要求显式指定；显式文件不可用时不回退其他凭据，Runner transport 和 Tunnel 凭据不能替代用户凭据。
+三个命令及 TUI 的用户凭据优先级为：命令行 `--user-token-file PATH` → `controller.toml` 的 `runner.user_token_file` → 默认连接扫描。扫描按原始 Server URL 和 Runner ID 匹配，优先选择包含当前 Runner 配置文件的连接；仅在零匹配时，兜底读取所使用的 `runner.toml` 路径同级的 `webcodex-user-token`，不递归扫描，也不要求 `server.toml`。连接歧义、选中连接的凭据不可用、显式文件无效均报错，不继续回退。Runner transport 和 Tunnel 凭据不能替代用户凭据。守护进程使用相同规则，但没有命令行凭据覆盖；只给 TUI 传入凭据不会配置守护进程。每轮观测重新读取凭据文件，支持原路径轮换；修改 Controller 配置需要重启 Controller。
 
 `wsl2_nat` 模式的默认凭据仍绑定原始 Runner 配置及已配对的 Server 连接，不会依据发现的网关地址猜测新的凭据目录。
 

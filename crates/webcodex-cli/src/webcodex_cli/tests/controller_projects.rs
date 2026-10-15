@@ -315,19 +315,21 @@ fn default_token_is_bound_to_server_runner_and_exact_connection() {
     let bases = vec![temp.path().to_path_buf()];
     assert_eq!(
         select_default_token(Path::new("/custom/runner.toml"), &view, &bases).unwrap(),
-        alice.user_token
+        Some(alice.user_token)
     );
     connection(temp.path(), "bob", "runner-a");
     assert!(select_default_token(Path::new("/custom/runner.toml"), &view, &bases).is_err());
     assert_eq!(
         select_default_token(&bob.runner_config.canonicalize().unwrap(), &view, &bases).unwrap(),
-        bob.user_token
+        Some(bob.user_token)
     );
     let other = RunnerConfigView {
         server_url: "https://other.test".into(),
         client_id: "runner-a".into(),
     };
-    assert!(select_default_token(&alice.runner_config, &other, &bases).is_err());
+    assert!(select_default_token(&alice.runner_config, &other, &bases)
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -509,4 +511,114 @@ async fn wsl2_project_mutation_refuses_changed_generation_before_http_dispatch()
     assert!(error.starts_with("controller_target_changed"));
     assert!(!error.contains("private-test-token"));
     task.await.unwrap();
+}
+
+#[test]
+fn default_user_credential_falls_back_only_for_zero_connection_matches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let detached = tmp.path().join("detached");
+    std::fs::create_dir(&detached).unwrap();
+    let config_path = detached.join("runner.toml");
+    std::fs::write(
+        &config_path,
+        "server_url = 'https://example.test'\nclient_id = 'runner-a'\n",
+    )
+    .unwrap();
+    let view = runner_view(&config_path).unwrap();
+    let identity = config_path.canonicalize().unwrap();
+    let base = tmp.path().join("connections");
+    let bases = [base.clone()];
+    let sibling = detached.join("webcodex-user-token");
+    std::fs::write(&sibling, "sibling-fixture").unwrap();
+    assert_eq!(
+        default_token_file_in_bases(&config_path, &identity, &view, &bases).unwrap(),
+        sibling
+    );
+    let alice = connection(&base, "alice", "runner-a");
+    // A selected connection is authoritative even when its token file is missing.
+    assert_eq!(
+        default_token_file_in_bases(&config_path, &identity, &view, &bases).unwrap(),
+        alice.user_token
+    );
+    assert!(!alice.user_token.exists());
+    let bob = connection(&base, "bob", "runner-a");
+    assert!(
+        default_token_file_in_bases(&config_path, &identity, &view, &bases)
+            .unwrap_err()
+            .contains("Ambiguous")
+    );
+    assert_eq!(
+        default_token_file_in_bases(
+            &bob.runner_config,
+            &bob.runner_config.canonicalize().unwrap(),
+            &view,
+            &bases
+        )
+        .unwrap(),
+        bob.user_token
+    );
+}
+
+#[test]
+fn user_credential_precedence_and_flat_runner_layout_are_shared() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runner = tmp.path().join("runner.toml");
+    std::fs::write(
+        &runner,
+        format!(
+            "server_url = 'https://credential-fixture.example.test'\nclient_id = '{}'\n",
+            uuid::Uuid::new_v4()
+        ),
+    )
+    .unwrap();
+    let mut config: ControllerConfig = toml::from_str(&format!(
+        "[server]\nmode='remote'\nurl='https://credential-fixture.example.test'\n[runner]\nconfig={runner:?}\n"
+    )).unwrap();
+    let view = runner_view(&runner).unwrap();
+    let sibling = tmp.path().join("webcodex-user-token");
+    assert!(read_user_token(&config, &view, None)
+        .unwrap_err()
+        .contains("failed to read"));
+    std::fs::write(&sibling, "default-fixture").unwrap();
+    assert_eq!(
+        read_user_token(&config, &view, None).unwrap(),
+        "default-fixture"
+    );
+    let configured = tmp.path().join("configured-token");
+    config.runner.user_token_file = Some(configured.clone());
+    assert!(read_user_token(&config, &view, None)
+        .unwrap_err()
+        .contains("failed to read"));
+    std::fs::write(&configured, "configured-fixture").unwrap();
+    assert_eq!(
+        read_user_token(&config, &view, None).unwrap(),
+        "configured-fixture"
+    );
+    let explicit = tmp.path().join("explicit-token");
+    assert!(read_user_token(&config, &view, Some(&explicit))
+        .unwrap_err()
+        .contains("failed to read"));
+    for (value, expected) in [
+        ("", "is empty"),
+        ("wc_agent_fixture", "Runner transport token"),
+    ] {
+        std::fs::write(&explicit, value).unwrap();
+        let error = read_user_token(&config, &view, Some(&explicit)).unwrap_err();
+        assert!(error.contains(expected));
+        assert!(!error.contains("wc_agent_fixture"));
+    }
+    std::fs::write(&explicit, "explicit-fixture").unwrap();
+    assert_eq!(
+        read_user_token(&config, &view, Some(&explicit)).unwrap(),
+        "explicit-fixture"
+    );
+    std::fs::write(&configured, "rotated-fixture").unwrap();
+    assert_eq!(
+        read_user_token(&config, &view, None).unwrap(),
+        "rotated-fixture"
+    );
+    config.runner.user_token_file = Some(PathBuf::new());
+    assert!(super::super::validate_config(&config)
+        .unwrap_err()
+        .contains("user_token_file"));
 }

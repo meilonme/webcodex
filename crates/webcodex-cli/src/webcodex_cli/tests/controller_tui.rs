@@ -180,6 +180,26 @@ fn render(app: &mut Overview, width: u16, height: u16) -> String {
 }
 
 #[test]
+fn runner_observations_render_from_the_daemon_without_project_state_inference() {
+    for phase in ["ready", "running_offline", "running_unverified"] {
+        let mut observed = status();
+        observed["runtime"]["runner"]["phase"] = json!(phase);
+        observed["runtime"]["runner"]["observed_at"] = json!("2026-10-16T01:02:03Z");
+        if phase == "running_unverified" {
+            observed["runtime"]["runner"]["observation_error"] = json!("project_access_denied");
+        }
+        let mut app = Overview::new();
+        app.status.update(Ok(observed));
+        let screen = render(&mut app, 160, 30);
+        assert!(screen.contains(phase));
+        assert!(screen.contains("2026-10-16T01:02:03Z"));
+        if phase == "running_unverified" {
+            assert!(screen.contains("project_access_denied"));
+        }
+    }
+}
+
+#[test]
 fn controller_tui_parser_preserves_paths_and_rejects_mutation_flags() {
     use super::super::{parse_controller_command, ControllerCommand};
     let command = parse_controller_command(

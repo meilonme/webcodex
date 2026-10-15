@@ -301,6 +301,5 @@ async fn server_auth_status_proves_only_reachability_and_redirects_are_rejected(
         });
         assert_eq!(probe(&url).await.is_ok(), matches!(status, 200 | 401 | 403));
         task.await.unwrap();
-        assert_eq!(runner_phase_after_start(false), "running_unverified");
     }
 }

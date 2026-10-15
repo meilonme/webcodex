@@ -21,6 +21,14 @@ use tokio::sync::{broadcast, watch};
 #[path = "controller_projects.rs"]
 mod projects;
 
+#[cfg(unix)]
+#[path = "controller_runner_observation.rs"]
+mod runner_observation;
+#[path = "controller_runner_query.rs"]
+mod runner_query;
+#[cfg(unix)]
+use runner_observation::RunnerMonitor;
+
 #[cfg(target_os = "linux")]
 #[path = "controller_wsl2_nat.rs"]
 mod wsl2_nat;
@@ -222,12 +230,15 @@ impl Default for ServerSettings {
 struct RunnerSettings {
     enabled: bool,
     config: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_token_file: Option<PathBuf>,
 }
 impl Default for RunnerSettings {
     fn default() -> Self {
         Self {
             enabled: true,
             config: PathBuf::new(),
+            user_token_file: None,
         }
     }
 }
@@ -256,6 +267,10 @@ struct ComponentSnapshot {
     phase: &'static str,
     pid: Option<u32>,
     restart_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observation_error: Option<&'static str>,
 }
 #[cfg(unix)]
 #[derive(Debug, Clone, Serialize)]
@@ -297,6 +312,8 @@ impl RuntimeComponent {
             phase: self.phase,
             pid: self.process.as_ref().and_then(|p| p.child.id()),
             restart_count: self.restart_count,
+            observed_at: None,
+            observation_error: None,
         }
     }
 }
@@ -312,9 +329,10 @@ struct ControllerRuntime {
     shutdown: bool,
     tunnel_ready_rx: Option<watch::Receiver<bool>>,
     wsl2_startup: Wsl2NatStartup,
+    runner_monitor: RunnerMonitor,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct RunnerConfigView {
     server_url: String,
     client_id: String,
@@ -592,6 +610,14 @@ impl ServerSettings {
 }
 
 fn validate_config(cfg: &ControllerConfig) -> Result<(), String> {
+    if cfg
+        .runner
+        .user_token_file
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err("runner.user_token_file must not be empty".into());
+    }
     if cfg.server.enabled == Some(false) {
         return Err(
             "server.enabled=false is no longer supported; select server.mode=\"local\" or \"remote\""
@@ -782,28 +808,6 @@ fn validate_runner_target(
     Err("Runner server_url does not match Controller Server".into())
 }
 
-#[cfg(any(unix, test))]
-fn runtime_has_online_runner(output: &Value, client_id: &str) -> bool {
-    output
-        .pointer("/runners/clients")
-        .and_then(Value::as_array)
-        .is_some_and(|items| {
-            items.iter().any(|item| {
-                item.get("client_id").and_then(Value::as_str) == Some(client_id)
-                    && item.get("status").and_then(Value::as_str) == Some("online")
-            })
-        })
-}
-
-#[cfg(any(unix, test))]
-fn runner_phase_after_start(online_verified: bool) -> &'static str {
-    if online_verified {
-        "ready"
-    } else {
-        "running_unverified"
-    }
-}
-
 fn controller_environment_value(path: &Path, key: &str) -> Result<Option<String>, String> {
     if let Ok(value) = std::env::var(key) {
         if !value.trim().is_empty() {
@@ -976,14 +980,17 @@ impl ControllerRuntime {
             shutdown: false,
             tunnel_ready_rx: None,
             wsl2_startup: Wsl2NatStartup::default(),
+            runner_monitor: RunnerMonitor::default(),
         }
     }
     fn snapshot(&self) -> ControllerSnapshot {
+        let mut runner = self.runner.snapshot();
+        self.runner_monitor.decorate(&mut runner, Instant::now());
         ControllerSnapshot {
             controller: if self.shutdown { "stopping" } else { "running" },
             server_mode: self.config.server.mode,
             server: self.server.snapshot(),
-            runner: self.runner.snapshot(),
+            runner,
             tunnel: self.tunnel.snapshot(),
             wsl2_nat_target: (self.config.server.mode == ServerMode::Wsl2Nat)
                 .then(|| self.wsl2_startup.snapshot.clone()),
@@ -1072,12 +1079,12 @@ impl ControllerRuntime {
                 remove_controller_tunnel_credentials(&mut command);
                 self.runner.process =
                     Some(spawn_process(command, "runner", self.log.clone(), None)?);
-                if self.config.server.mode == ServerMode::Wsl2Nat {
-                    self.wsl2_startup.started_at = Some(Instant::now());
-                    return Ok(());
-                }
-                let online_verified = self.wait_runner_startup(&view, &server_url).await?;
-                self.runner.phase = runner_phase_after_start(online_verified);
+                self.runner_monitor.start(
+                    server_url,
+                    view,
+                    self.wsl2_startup.snapshot.generation.clone(),
+                );
+                self.poll_runner_observation().await;
             }
             Component::Tunnel => {
                 if !self.config.server.is_local() {
@@ -1128,6 +1135,9 @@ impl ControllerRuntime {
         Ok(())
     }
     async fn stop_component(&mut self, component: Component) {
+        if component == Component::Runner {
+            self.runner_monitor.reset();
+        }
         if component == Component::Runner && self.config.server.mode == ServerMode::Wsl2Nat {
             self.wsl2_startup.cancel();
         }
@@ -1207,37 +1217,6 @@ impl ControllerRuntime {
             wait_remote_server_reachable(&base).await
         }
     }
-    async fn wait_runner_startup(
-        &mut self,
-        view: &RunnerConfigView,
-        server_url: &str,
-    ) -> Result<bool, String> {
-        if self.config.server.is_local() {
-            let token = server_token(self.config.server.local_env_file()?)?;
-            wait_runtime_status(server_url, token.as_deref(), |output| {
-                runtime_has_online_runner(output, &view.client_id)
-            })
-            .await?;
-            return Ok(true);
-        }
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if let Some(status) = self
-                .runner
-                .process
-                .as_mut()
-                .and_then(|process| process.child.try_wait().ok().flatten())
-            {
-                return Err(format!("Runner exited before becoming stable: {status}"));
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        // Without a user Runtime credential the Controller cannot prove that
-        // a remote Server has registered this Runner. Surviving startup only
-        // proves the local process is stable; project commands perform the
-        // authoritative online check before any project operation.
-        Ok(false)
-    }
     async fn wait_tunnel_ready(&mut self) -> Result<(), String> {
         let Some(mut rx) = self.tunnel_ready_rx.clone() else {
             return Err("Tunnel readiness channel unavailable".to_string());
@@ -1279,6 +1258,9 @@ impl ControllerRuntime {
             };
             target.process = None;
             target.phase = "failed";
+            if component == Component::Runner {
+                self.runner_monitor.reset();
+            }
             if component == Component::Runner && self.config.server.mode == ServerMode::Wsl2Nat {
                 self.wsl2_startup.cancel();
                 if matches!(status.code(), Some(2 | 77 | 78)) {
@@ -1347,6 +1329,7 @@ impl ControllerRuntime {
                 break;
             }
         }
+        self.poll_runner_observation().await;
     }
 }
 
@@ -1367,6 +1350,7 @@ fn render_default_config() -> Result<String, String> {
             port: None,
         },
         runner: RunnerSettings {
+            user_token_file: None,
             enabled: true,
             config: home.join(".config/webcodex/runner.toml"),
         },
@@ -1434,6 +1418,37 @@ fn doctor_report(config: &ControllerConfig, environment_file: &Path) -> Result<V
         },
         "existing_service_conflicts": service_conflicts
     }))
+}
+
+fn runner_observation_text(runtime: &Value) -> String {
+    let runner = &runtime["runner"];
+    let mut text = String::new();
+    if let Some(at) = runner["observed_at"].as_str() {
+        text.push_str(&format!("Runner observed: {at}\n"));
+    }
+    if let Some(error) = runner["observation_error"].as_str() {
+        text.push_str(&format!("Runner observation: {error}\n"));
+    }
+    text
+}
+
+fn runner_doctor_text(report: &Value) -> String {
+    let runner = &report["runner"];
+    if runner["enabled"] == false {
+        return "disabled".into();
+    }
+    let configuration = if runner["config_file"] == true
+        && runner["binary"] == true
+        && runner["server_matches_controller"] == true
+    {
+        "ok"
+    } else {
+        "check required"
+    };
+    format!(
+        "{} (configuration: {configuration})",
+        runner["phase"].as_str().unwrap_or("unknown")
+    )
 }
 
 fn wsl2_target_text(report: &Value) -> String {
@@ -1992,6 +2007,9 @@ pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result
                 let mut report = report;
                 if cfg.server.mode == ServerMode::Wsl2Nat {
                     wsl2_startup::doctor(&cfg, &mut report).await?;
+                } else {
+                    let runtime = runner_observation::live_snapshot(&cfg).await?;
+                    runner_observation::attach_runtime(&mut report, runtime);
                 }
                 report
             };
@@ -2016,16 +2034,7 @@ pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result
                     }
                     _ => "check required",
                 },
-                if report["runner"]["enabled"].as_bool() == Some(false) {
-                    "disabled"
-                } else if report["runner"]["config_file"].as_bool() == Some(true)
-                    && report["runner"]["binary"].as_bool() == Some(true)
-                    && report["runner"]["server_matches_controller"].as_bool() == Some(true)
-                {
-                    "ok"
-                } else {
-                    "check required"
-                },
+                runner_doctor_text(&report),
                 if report["tunnel"]["enabled"].as_bool() == Some(false) {
                     "disabled"
                 } else if report["tunnel"]["credentials_present"].as_bool() == Some(true) {
@@ -2033,7 +2042,11 @@ pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result
                 } else {
                     "credentials missing"
                 },
-                wsl2_target_text(&report),
+                format!(
+                    "{}{}",
+                    wsl2_target_text(&report),
+                    runner_observation_text(&report["runtime"])
+                ),
             ))
         }
         ControllerCommand::Run { config } => {
@@ -2108,7 +2121,7 @@ pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result
                             result["tunnel"]["phase"].as_str().unwrap_or("unknown"),
                             service.active,
                             service.enabled,
-                            wsl2_target_text(result),
+                            format!("{}{}", wsl2_target_text(result), runner_observation_text(result)),
                         ));
                     }
                 }
@@ -2343,6 +2356,7 @@ mod tests {
                 port: None,
             },
             runner: RunnerSettings {
+                user_token_file: None,
                 enabled: false,
                 config: PathBuf::new(),
             },
@@ -2370,6 +2384,7 @@ mod tests {
                 port: None,
             },
             runner: RunnerSettings {
+                user_token_file: None,
                 enabled: true,
                 config: "/tmp/runner.toml".into(),
             },
@@ -2380,37 +2395,6 @@ mod tests {
             },
         };
         assert!(validate_config(&cfg).unwrap_err().contains("remote"));
-    }
-
-    #[test]
-    fn runner_readiness_uses_canonical_runner_projection_only() {
-        let canonical = json!({
-            "runners": {
-                "clients": [{
-                    "client_id": "special",
-                    "status": "online"
-                }]
-            }
-        });
-        assert!(runtime_has_online_runner(&canonical, "special"));
-
-        let legacy = json!({
-            "agents": {
-                "summary": {
-                    "clients": [{
-                        "client_id": "special",
-                        "status": "online"
-                    }]
-                }
-            }
-        });
-        assert!(!runtime_has_online_runner(&legacy, "special"));
-    }
-
-    #[test]
-    fn remote_runner_process_stability_is_not_online_readiness() {
-        assert_eq!(runner_phase_after_start(true), "ready");
-        assert_eq!(runner_phase_after_start(false), "running_unverified");
     }
 
     #[test]
@@ -2513,6 +2497,7 @@ mod tests {
                 port: None,
             },
             runner: RunnerSettings {
+                user_token_file: None,
                 enabled: false,
                 config: PathBuf::new(),
             },

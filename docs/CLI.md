@@ -246,6 +246,10 @@ Project management:
 
 The [server] section supports mode = "local", mode = "remote", and mode = "wsl2_nat". Local mode requires env_file and the Controller starts/supervises webcodex-server. Remote mode requires url; the Controller only probes that Server, does not start a local Server, and rejects a local regular Tunnel. In local/remote modes the Runner uses the local runner.toml, whose server_url must match the Controller Server target. The Controller refuses duplicate ownership of existing local webcodex.service, webcodex.socket, or webcodex-runner.service instances.
 
+In all three modes, the Controller daemon uses a user API credential to observe the configured Runner immediately after startup and every 10 seconds thereafter. Each query has a 3-second timeout and a 1 MiB response limit. The Runner is `starting` before its first observation, `ready` when the Server confirms it online, `running_offline` when explicitly reported non-online while its process survives, and `running_unverified` when credentials, access, visibility or the query fail. Failures immediately revoke previous online evidence; observations also expire after 30 seconds. Observation never blocks IPC, triggers a restart or rediscovers the WSL gateway. Stopping or replacing the Runner clears old observations.
+
+TUI, `status` and online `doctor` share the daemon's state. Runner snapshots include optional `observed_at` and `observation_error`; text and TUI views also show the observation time and error category. `doctor` distinguishes configuration checks from runtime status; an unavailable daemon leaves Runner online status unknown. Project commands still perform their own online checks and never use the display cache as execution authority.
+
 `wsl2_nat` is exclusively for a Runner inside WSL2 NAT connecting automatically to its Windows Desktop Server. Other VM/network topologies are outside its support contract. Configure the Controller as follows:
 
 ```toml
@@ -258,6 +262,8 @@ port = 8080       # Required
 [runner]
 enabled = true
 config = "/home/user/.config/webcodex/clients/wsl2-runner/runner.toml"
+# Optional user API credential; omitted values use automatic selection
+# user_token_file = "/home/user/.config/webcodex/webcodex-user-token"
 
 [tunnel]
 enabled = false
@@ -269,13 +275,13 @@ Discovery and probing run only before a new Runner startup attempt. Missing rout
 
 The Controller starts the Runner with `webcodex-runner --config PATH --server-url URL --stop-on-stdin-eof`. The standalone Runner's `--server-url` has the same meaning and validation as `runner.toml`'s `server_url`, with CLI precedence for that process, including hot reload. An invalid explicit value fails without falling back. The configuration file, identity, credentials, project registry and policies are preserved. Controller-managed gateway requests bypass proxies through child-local proxy exclusions; global environment variables are unchanged.
 
-`status --json` reports the current target, generation, binding, sampling time and discovery/probe errors in `wsl2_nat_target`. `doctor --json` uses the active snapshot when the Controller is online; offline discovery is marked `candidate`. Reachability, including HTTP 401/403, never proves Runner authentication. A stable child remains `running_unverified` until an authorized Server query proves it online.
+`status --json` reports the current target, generation, binding, sampling time and discovery/probe errors in `wsl2_nat_target`. `doctor --json` uses the active snapshot when the Controller is online; offline discovery is marked `candidate`. Reachability, including HTTP 401/403, never proves Runner authentication. Runner online status is maintained by the authenticated observations described above.
 
 `controller install` installs a user service at `~/.config/systemd/user/webcodex-controller.service` by default and manages it through `systemctl --user`. `status` prefers the live Controller Unix Socket and also reports service state; if the socket is unavailable it still reports the installed service. `logs` prefers the Controller's bounded in-memory component logs and falls back to the user journal. Add `-f` or `--follow` to print the recent tail and keep reading new logs until Ctrl+C; `--lines N` controls the initial tail. If an in-memory follower disconnects or falls behind, it reports an error; rerun the command to read the latest logs. `stop` automatically handles a foreground Controller or installed service. A component-less `restart` prefers an installed service and otherwise restarts the foreground runtime; `restart server|runner|tunnel` always uses Controller IPC. `uninstall --confirm` removes only the Controller unit and preserves controller.toml and controller.env.
 
 All `controller project` commands require `runner.enabled=true` and the configured Runner to be online and visible through the Server. In local/remote modes the Controller daemon itself need not be running. In `wsl2_nat` mode the daemon must be running with an active target matching the current configuration. Project operations use that pinned endpoint and check its generation before each request; an unavailable Controller, unresolved target or changed generation fails explicitly. Offline, inaccessible, or unsupported targets fail explicitly; there is no local registry fallback or automatic Runner start.
 
-Each command accepts `--user-token-file PATH`. When omitted, the CLI selects the matching Server/Runner connection's `webcodex-user-token`, preferring the connection containing the configured Runner file. A missing or ambiguous default requires an explicit file. An explicit file never falls back to another credential; Runner transport and Tunnel credentials are not substitutes.
+Credential precedence for project commands and TUI is: CLI `--user-token-file PATH` → `runner.user_token_file` in `controller.toml` → default connection discovery. Discovery matches the original Server URL and Runner ID, preferring the connection containing the configured Runner file. Only zero matches permit a fallback to `webcodex-user-token` beside the Runner configuration path in use; this is not a recursive scan and requires no `server.toml`. Ambiguous connections, an unusable selected connection credential or an invalid explicit file fail without further fallback. Runner transport and Tunnel credentials are not substitutes. The daemon uses the same rules without a CLI credential override; supplying a credential only to TUI does not configure the daemon. Each observation rereads the credential file to support rotation at the same path; changing Controller configuration requires a Controller restart.
 
 In `wsl2_nat` mode default credentials remain bound to the original Runner configuration and enrolled Server connection; the discovered gateway is never used to guess a new credential directory.
 
