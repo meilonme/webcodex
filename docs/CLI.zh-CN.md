@@ -185,13 +185,40 @@ Tab 切换项目/日志焦点，方向键及 PageUp/PageDown 滚动，Space 暂�
     webcodex controller project register /path/to/project
     webcodex controller project remove <project-id-or-path>
 
-Controller 的 [server] 支持 mode = "local" 与 mode = "remote"。local 模式要求 env_file，Controller 会启动并监督 webcodex-server；remote 模式要求 url，Controller 只探测远程 Server，不启动本地 Server，也禁止本地 regular Tunnel。两种模式下 Runner 都使用本机 runner.toml，且其中的 server_url 必须与 Controller 配置的 Server 一致。Controller 不接管已经由 webcodex.service / webcodex.socket / webcodex-runner.service 管理的同类本地实例。
+Controller 的 [server] 支持 mode = "local"、mode = "remote" 与 mode = "wsl2_nat"。local 模式要求 env_file，Controller 会启动并监督 webcodex-server；remote 模式要求 url，Controller 只探测远程 Server，不启动本地 Server，也禁止本地 regular Tunnel。local/remote 模式下 Runner 都使用本机 runner.toml，且其中的 server_url 必须与 Controller 配置的 Server 一致。Controller 不接管已经由 webcodex.service / webcodex.socket / webcodex-runner.service 管理的同类本地实例。
+
+`wsl2_nat` 专用于 WSL2 NAT 内的 Runner 自动连接 Windows 宿主机上的 Desktop Server，不考虑其他虚拟机或网络拓扑兼容。Controller 配置如下：
+
+```toml
+[server]
+mode = "wsl2_nat"
+interface = "eth0" # 可省略，默认 eth0
+scheme = "http"   # 可省略，默认 http
+port = 8080       # 必填
+
+[runner]
+enabled = true
+config = "/home/user/.config/webcodex/clients/wsl2-runner/runner.toml"
+
+[tunnel]
+enabled = false
+```
+
+该模式固定通过 Rust Netlink 读取指定接口 IPv4 主路由表的默认网关。省略 interface/scheme 时分别使用 `eth0`/`http`，显式空值或非法值报错；禁止配置 `server.url` 和 `server.env_file`。Windows Desktop Server 必须允许 WSL NAT 接口连接，防火墙应仅放行受信 WSL 来源。Runner 须预先在该 Server 完成配对；发现地址不代表 Server 身份可信，也不会迁移凭据。HTTP 仅用于受信宿主机/WSL 私有链路，HTTPS 保留证书验证。使用默认 WebSocket、polling 或不含 QUIC 配置段的 auto；该模式拒绝固定 QUIC 端点。
+
+地址发现和探测只在新一轮 Runner 启动尝试前执行。缺少路由或 Desktop Server 不可达时，Controller 保持 IPC 可用，状态为 `waiting_for_desktop_server` / `waiting_for_server`，以可取消、最多 30 秒的退避等待重试，不消耗子进程崩溃重启次数。实际重新启动 Runner 前会重新解析；存活的 Runner 不触发路由轮询、自动改绑或网络驱动重启，NAT 地址改变后可显式执行 `controller restart runner`。认证/注册失败会停止自动恢复并报告 `runner_auth_failed`。该模式不能重启 Windows Server 或管理其 Tunnel。
+
+Controller 通过 `webcodex-runner --config PATH --server-url URL --stop-on-stdin-eof` 启动 Runner。独立 Runner 的 `--server-url` 与 `runner.toml` 的 `server_url` 含义和校验相同，命令行值在本次进程及热重载时始终优先；显式无效值直接报错，不回退配置值。配置文件、身份、凭据、项目注册目录及策略保持不变。Controller 使用子进程局部代理排除项，确保网关请求不经代理，不修改全局环境变量。
+
+`status --json` 的 `wsl2_nat_target` 报告当前目标、代次、配置绑定、采样时间及解析/探测错误。`doctor --json` 在线时使用活动快照，离线发现明确标记为 `candidate`。网络可达（包括 HTTP 401/403）不代表 Runner 已认证；子进程稳定后仍显示 `running_unverified`，直到受权 Server 查询证明在线。
 
 `controller install` 默认安装 user service 到 `~/.config/systemd/user/webcodex-controller.service`，并通过 `systemctl --user` 管理 Controller 生命周期。`status` 会优先读取正在运行的 Controller Unix Socket，并同时显示 systemd 状态；Socket 不可用时仍可显示已安装 service 状态。`logs` 优先读取 Controller 内存中的组件日志，Controller 不可达时回退到 user journal。添加 `-f` 或 `--follow` 可先输出最近日志，再持续读取新增日志，按 Ctrl+C 退出；`--lines N` 控制首次读取的行数。内存日志跟随连接断开或读取速度落后时会明确报错，可重新运行命令读取最新日志。`stop` 会自动识别前台 Controller 与 systemd service；无组件参数的 `restart` 优先重启已安装 service，否则重启前台 runtime。`restart server|runner|tunnel` 始终通过 Controller IPC 操作组件。`uninstall --confirm` 只删除 Controller unit，不删除 controller.toml 或 controller.env。
 
-所有 `controller project` 命令均要求 `runner.enabled=true`，且指定 Runner 在 Server 上在线并对当前凭据可见；Controller 守护进程本身不必运行。Runner 离线、目标不可访问或版本不支持时明确报错，不回退本地 registry，也不自动启动 Runner。
+所有 `controller project` 命令均要求 `runner.enabled=true`，且指定 Runner 在 Server 上在线并对当前凭据可见。local/remote 模式下 Controller 守护进程本身不必运行；`wsl2_nat` 模式要求守护进程在线，并具有与当前配置匹配的活动目标。项目操作使用固定的有效端点，每次请求前检查代次；Controller 不可用、目标未解析或代次改变时明确报错。Runner 离线、目标不可访问或版本不支持时明确报错，不回退本地 registry，也不自动启动 Runner。
 
 三个命令均支持 `--user-token-file PATH`。未指定时使用匹配 Server/Runner 连接的默认 `webcodex-user-token`，优先选择包含当前 Runner 配置文件的连接。默认连接缺失或存在歧义时要求显式指定；显式文件不可用时不回退其他凭据，Runner transport 和 Tunnel 凭据不能替代用户凭据。
+
+`wsl2_nat` 模式的默认凭据仍绑定原始 Runner 配置及已配对的 Server 连接，不会依据发现的网关地址猜测新的凭据目录。
 
 Runner 超过 100 个项目时，可使用 Server 返回的完整项目 ID（例如 `agent:runner-a:demo`）删除，命令会在 Server 侧精确筛选库存。短 ID 和路径匹配要求库存未截断，以便可靠拒绝歧义目标。
 

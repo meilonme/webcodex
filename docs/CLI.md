@@ -244,13 +244,40 @@ Project management:
     webcodex controller project register /path/to/project
     webcodex controller project remove <project-id-or-path>
 
-The [server] section supports mode = "local" and mode = "remote". Local mode requires env_file and the Controller starts/supervises webcodex-server. Remote mode requires url; the Controller only probes that Server, does not start a local Server, and rejects a local regular Tunnel. In both modes the Runner uses the local runner.toml, whose server_url must match the Controller Server target. The Controller refuses duplicate ownership of existing local webcodex.service, webcodex.socket, or webcodex-runner.service instances.
+The [server] section supports mode = "local", mode = "remote", and mode = "wsl2_nat". Local mode requires env_file and the Controller starts/supervises webcodex-server. Remote mode requires url; the Controller only probes that Server, does not start a local Server, and rejects a local regular Tunnel. In local/remote modes the Runner uses the local runner.toml, whose server_url must match the Controller Server target. The Controller refuses duplicate ownership of existing local webcodex.service, webcodex.socket, or webcodex-runner.service instances.
+
+`wsl2_nat` is exclusively for a Runner inside WSL2 NAT connecting automatically to its Windows Desktop Server. Other VM/network topologies are outside its support contract. Configure the Controller as follows:
+
+```toml
+[server]
+mode = "wsl2_nat"
+interface = "eth0" # Optional; defaults to eth0
+scheme = "http"   # Optional; defaults to http
+port = 8080       # Required
+
+[runner]
+enabled = true
+config = "/home/user/.config/webcodex/clients/wsl2-runner/runner.toml"
+
+[tunnel]
+enabled = false
+```
+
+The mode fixes address discovery to the selected interface's IPv4 main-table default gateway, read through Rust Netlink. Omitted interface/scheme values default to `eth0`/`http`; explicit empty or invalid values fail validation. `server.url` and `server.env_file` are forbidden. The Windows Desktop Server must accept connections on the WSL NAT interface, with firewall access restricted to trusted WSL sources. The Runner must already be enrolled on that Server; discovering an address does not establish Server identity or migrate credentials. HTTP requires a trusted host/WSL private link; HTTPS retains certificate verification. Use WebSocket (default), polling, or auto without a QUIC section; fixed QUIC endpoints are rejected.
+
+Discovery and probing run only before a new Runner startup attempt. Missing routes or an unavailable Desktop Server leave the Controller IPC available with `waiting_for_desktop_server` / `waiting_for_server`, using cancellable backoff capped at 30 seconds without consuming the child-crash restart budget. Each actual Runner restart discovers again. A live Runner never triggers route polling, automatic rebinding or a network-driven restart; use `controller restart runner` explicitly after a NAT address change. Authentication/registration failures stop automatic recovery and report `runner_auth_failed`. This mode cannot restart the Windows Server or manage its Tunnel.
+
+The Controller starts the Runner with `webcodex-runner --config PATH --server-url URL --stop-on-stdin-eof`. The standalone Runner's `--server-url` has the same meaning and validation as `runner.toml`'s `server_url`, with CLI precedence for that process, including hot reload. An invalid explicit value fails without falling back. The configuration file, identity, credentials, project registry and policies are preserved. Controller-managed gateway requests bypass proxies through child-local proxy exclusions; global environment variables are unchanged.
+
+`status --json` reports the current target, generation, binding, sampling time and discovery/probe errors in `wsl2_nat_target`. `doctor --json` uses the active snapshot when the Controller is online; offline discovery is marked `candidate`. Reachability, including HTTP 401/403, never proves Runner authentication. A stable child remains `running_unverified` until an authorized Server query proves it online.
 
 `controller install` installs a user service at `~/.config/systemd/user/webcodex-controller.service` by default and manages it through `systemctl --user`. `status` prefers the live Controller Unix Socket and also reports service state; if the socket is unavailable it still reports the installed service. `logs` prefers the Controller's bounded in-memory component logs and falls back to the user journal. Add `-f` or `--follow` to print the recent tail and keep reading new logs until Ctrl+C; `--lines N` controls the initial tail. If an in-memory follower disconnects or falls behind, it reports an error; rerun the command to read the latest logs. `stop` automatically handles a foreground Controller or installed service. A component-less `restart` prefers an installed service and otherwise restarts the foreground runtime; `restart server|runner|tunnel` always uses Controller IPC. `uninstall --confirm` removes only the Controller unit and preserves controller.toml and controller.env.
 
-All `controller project` commands require `runner.enabled=true` and the configured Runner to be online and visible through the Server. The Controller daemon itself need not be running. Offline, inaccessible, or unsupported targets fail explicitly; there is no local registry fallback or automatic Runner start.
+All `controller project` commands require `runner.enabled=true` and the configured Runner to be online and visible through the Server. In local/remote modes the Controller daemon itself need not be running. In `wsl2_nat` mode the daemon must be running with an active target matching the current configuration. Project operations use that pinned endpoint and check its generation before each request; an unavailable Controller, unresolved target or changed generation fails explicitly. Offline, inaccessible, or unsupported targets fail explicitly; there is no local registry fallback or automatic Runner start.
 
 Each command accepts `--user-token-file PATH`. When omitted, the CLI selects the matching Server/Runner connection's `webcodex-user-token`, preferring the connection containing the configured Runner file. A missing or ambiguous default requires an explicit file. An explicit file never falls back to another credential; Runner transport and Tunnel credentials are not substitutes.
+
+In `wsl2_nat` mode default credentials remain bound to the original Runner configuration and enrolled Server connection; the discovered gateway is never used to guess a new credential directory.
 
 When a Runner has more than 100 projects, remove by the full project ID returned by the Server (for example `agent:runner-a:demo`); this uses an exact Server-side inventory filter. Short IDs and paths require an untruncated inventory to reject ambiguous targets safely.
 

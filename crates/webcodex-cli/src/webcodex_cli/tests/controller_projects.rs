@@ -54,6 +54,8 @@ async fn server(
     (
         ProjectClient {
             server: format!("http://{address}"),
+            #[cfg(unix)]
+            target_fence: None,
             client_id: "runner-a".into(),
             token: "fixture-user-token".into(),
             http: ServerHttpOptions {
@@ -462,4 +464,49 @@ async fn explicit_invalid_credentials_never_fall_back_to_default() {
         .unwrap(),
         &paths.user_token
     ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wsl2_project_mutation_refuses_changed_generation_before_http_dispatch() {
+    use crate::webcodex_cli::controller::{
+        controller_socket,
+        wsl2_startup::{Binding, Wsl2NatSnapshot},
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let runner = tmp.path().join("runner.toml");
+    std::fs::write(&runner, "server_url = 'http://172.20.0.1:8080'\nclient_id = 'wsl-runner'\ntoken = 'private-test-token'\n").unwrap();
+    let cfg: ControllerConfig = toml::from_str(&format!("[server]\nmode = 'wsl2_nat'\nport = 8080\n[runner]\nconfig = {:?}\n[controller]\nruntime_dir = {:?}\n", runner, tmp.path())).unwrap();
+    let state = Wsl2NatSnapshot {
+        effective_url: Some("http://172.29.32.1:8080".into()),
+        generation: Some("new-generation".into()),
+        binding: Some(Binding::read(&cfg).unwrap()),
+        probe_state: "reachable".into(),
+        ..Default::default()
+    };
+    let listener = tokio::net::UnixListener::bind(controller_socket(&cfg).unwrap()).unwrap();
+    let task = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(5), async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new(); reader.read_line(&mut line).await.unwrap();
+            reader.get_mut().write_all(format!("{}\n", json!({"ok":true,"result":{
+                "server_mode":"wsl2_nat", "runner":{"phase":"running_unverified"}, "wsl2_nat_target":state
+            }})).as_bytes()).await.unwrap();
+        }).await.unwrap();
+    });
+    let client = ProjectClient {
+        server: "http://172.29.32.1:8080".into(),
+        client_id: "wsl-runner".into(),
+        token: "private-test-token".into(),
+        http: ServerHttpOptions::default(),
+        target_fence: Some((cfg, "old-generation".into())),
+    };
+    let error = client
+        .request("/api/tools/call", json!({}), true)
+        .await
+        .unwrap_err();
+    assert!(error.starts_with("controller_target_changed"));
+    assert!(!error.contains("private-test-token"));
+    task.await.unwrap();
 }

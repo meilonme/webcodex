@@ -81,6 +81,8 @@ struct ProjectClient {
     client_id: String,
     token: String,
     http: ServerHttpOptions,
+    #[cfg(unix)]
+    target_fence: Option<(ControllerConfig, String)>,
 }
 
 impl ProjectClient {
@@ -94,6 +96,17 @@ impl ProjectClient {
     }
 
     async fn request(&self, path: &str, body: Value, mutation: bool) -> Result<Value, String> {
+        #[cfg(unix)]
+        if let Some((config, generation)) = &self.target_fence {
+            let state = super::wsl2_startup::active_target(config).await?;
+            if state.generation.as_ref() != Some(generation)
+                || state.effective_url.as_deref() != Some(&self.server)
+            {
+                return Err(
+                    "controller_target_changed: observe the active target before retrying".into(),
+                );
+            }
+        }
         let response = tokio::time::timeout(
             // The Server's project-op wait is 32 seconds; leave time for its terminal response.
             Duration::from_secs(45),
@@ -337,8 +350,23 @@ async fn run_inner(
     }
     let view = runner_view(&config.runner.config)?;
     let server = connections::canonical_server_url(&view.server_url)?.url;
+    #[cfg(unix)]
+    let (server, target_fence) = if config.server.mode == super::ServerMode::Wsl2Nat {
+        let state = super::wsl2_startup::active_target(config).await?;
+        (
+            state.effective_url.ok_or("wsl2_nat_target_unresolved")?,
+            Some((
+                config.clone(),
+                state.generation.ok_or("wsl2_nat_target_unresolved")?,
+            )),
+        )
+    } else {
+        super::validate_runner_target(&view, &configured_server_url(config)?)?;
+        (server, None)
+    };
+    #[cfg(not(unix))]
     if server != connections::canonical_server_url(&configured_server_url(config)?)?.url {
-        return Err("Runner server_url does not match the Controller Server".to_string());
+        return Err("Runner server_url does not match the Controller Server".into());
     }
     let token_file = match token_file {
         Some(path) => path.to_path_buf(),
@@ -348,7 +376,8 @@ async fn run_inner(
         .ok_or("User credential is missing; pass --user-token-file PATH")?;
     validate_user_api_token(&token)?;
     let http = ServerHttpOptions {
-        no_system_proxy: project::server_url_is_loopback(&server),
+        no_system_proxy: config.server.mode == super::ServerMode::Wsl2Nat
+            || project::server_url_is_loopback(&server),
         ..ServerHttpOptions::default()
     };
     ProjectClient {
@@ -356,6 +385,8 @@ async fn run_inner(
         client_id: view.client_id,
         token,
         http,
+        #[cfg(unix)]
+        target_fence,
     }
     .execute(action)
     .await

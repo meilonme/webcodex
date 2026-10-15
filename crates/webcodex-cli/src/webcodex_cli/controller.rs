@@ -21,6 +21,15 @@ use tokio::sync::{broadcast, watch};
 #[path = "controller_projects.rs"]
 mod projects;
 
+#[cfg(target_os = "linux")]
+#[path = "controller_wsl2_nat.rs"]
+mod wsl2_nat;
+#[cfg(unix)]
+#[path = "controller_wsl2_nat_startup.rs"]
+mod wsl2_startup;
+#[cfg(unix)]
+use wsl2_startup::{Wsl2NatSnapshot, Wsl2NatStartup};
+
 #[cfg(unix)]
 #[path = "controller_tui.rs"]
 mod tui;
@@ -174,6 +183,7 @@ enum ServerMode {
     #[default]
     Local,
     Remote,
+    Wsl2Nat,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -186,6 +196,12 @@ struct ServerSettings {
     url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    interface: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scheme: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
 }
 impl Default for ServerSettings {
     fn default() -> Self {
@@ -194,6 +210,9 @@ impl Default for ServerSettings {
             env_file: None,
             url: None,
             enabled: None,
+            interface: None,
+            scheme: None,
+            port: None,
         }
     }
 }
@@ -246,6 +265,8 @@ struct ControllerSnapshot {
     server: ComponentSnapshot,
     runner: ComponentSnapshot,
     tunnel: ComponentSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wsl2_nat_target: Option<Wsl2NatSnapshot>,
 }
 
 #[cfg(unix)]
@@ -290,6 +311,7 @@ struct ControllerRuntime {
     log_followers: tokio::task::JoinSet<()>,
     shutdown: bool,
     tunnel_ready_rx: Option<watch::Receiver<bool>>,
+    wsl2_startup: Wsl2NatStartup,
 }
 
 #[derive(Debug, Deserialize)]
@@ -535,6 +557,13 @@ fn controller_socket(config: &ControllerConfig) -> Result<PathBuf, String> {
 }
 
 impl ServerSettings {
+    fn wsl2_interface(&self) -> &str {
+        self.interface.as_deref().unwrap_or("eth0")
+    }
+    fn wsl2_scheme(&self) -> &str {
+        self.scheme.as_deref().unwrap_or("http")
+    }
+
     fn is_local(&self) -> bool {
         self.mode == ServerMode::Local
     }
@@ -569,6 +598,13 @@ fn validate_config(cfg: &ControllerConfig) -> Result<(), String> {
                 .to_string(),
         );
     }
+    if cfg.server.mode != ServerMode::Wsl2Nat
+        && (cfg.server.interface.is_some()
+            || cfg.server.scheme.is_some()
+            || cfg.server.port.is_some())
+    {
+        return Err("server.interface/scheme/port require server.mode=\"wsl2_nat\"".into());
+    }
     match cfg.server.mode {
         ServerMode::Local => {
             cfg.server.local_env_file()?;
@@ -579,6 +615,36 @@ fn validate_config(cfg: &ControllerConfig) -> Result<(), String> {
                 .is_some_and(|url| !url.trim().is_empty())
             {
                 return Err("server.url must be omitted when server.mode=\"local\"".to_string());
+            }
+        }
+        ServerMode::Wsl2Nat => {
+            if !cfg!(target_os = "linux") {
+                return Err("wsl2_nat requires a Linux Runner inside WSL2 NAT".into());
+            }
+            let interface = cfg.server.wsl2_interface();
+            if interface.is_empty()
+                || interface.len() > 15
+                || interface == "."
+                || interface == ".."
+                || !interface
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+            {
+                return Err("server.interface must be a valid Linux interface name".into());
+            }
+            if !matches!(cfg.server.wsl2_scheme(), "http" | "https") {
+                return Err("server.scheme must be http or https".into());
+            }
+            if cfg.server.port.is_none_or(|port| port == 0) {
+                return Err("server.port is required and must be in 1..=65535".into());
+            }
+            if cfg.server.env_file.is_some() || cfg.server.url.is_some() {
+                return Err("server.env_file and server.url must be omitted for wsl2_nat".into());
+            }
+            if cfg.tunnel.enabled || !cfg.runner.enabled {
+                return Err(
+                    "wsl2_nat requires runner.enabled=true and tunnel.enabled=false".into(),
+                );
             }
         }
         ServerMode::Remote => {
@@ -672,6 +738,9 @@ fn configured_server_url(config: &ControllerConfig) -> Result<String, String> {
     match config.server.mode {
         ServerMode::Local => server_base_url(config.server.local_env_file()?),
         ServerMode::Remote => config.server.remote_url(),
+        ServerMode::Wsl2Nat => {
+            Err("wsl2_nat_target_unresolved: use the active Controller target".into())
+        }
     }
 }
 
@@ -689,7 +758,7 @@ fn runner_view(path: &Path) -> Result<RunnerConfigView, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read Runner config {}: {e}", path.display()))?;
     toml::from_str(&text)
-        .map_err(|e| format!("failed to parse Runner config {}: {e}", path.display()))
+        .map_err(|_| "runner_config_invalid: could not parse Runner configuration".to_string())
 }
 
 fn same_server_origin(left: &str, right: &str) -> bool {
@@ -710,10 +779,7 @@ fn validate_runner_target(
     if same_server_origin(&view.server_url, controller_server_url) {
         return Ok(());
     }
-    Err(format!(
-        "Runner server_url {:?} does not match Controller Server {}",
-        view.server_url, controller_server_url
-    ))
+    Err("Runner server_url does not match Controller Server".into())
 }
 
 #[cfg(any(unix, test))]
@@ -909,6 +975,7 @@ impl ControllerRuntime {
             log_followers: tokio::task::JoinSet::new(),
             shutdown: false,
             tunnel_ready_rx: None,
+            wsl2_startup: Wsl2NatStartup::default(),
         }
     }
     fn snapshot(&self) -> ControllerSnapshot {
@@ -918,9 +985,14 @@ impl ControllerRuntime {
             server: self.server.snapshot(),
             runner: self.runner.snapshot(),
             tunnel: self.tunnel.snapshot(),
+            wsl2_nat_target: (self.config.server.mode == ServerMode::Wsl2Nat)
+                .then(|| self.wsl2_startup.snapshot.clone()),
         }
     }
     async fn start_all(&mut self) -> Result<(), String> {
+        if self.config.server.mode == ServerMode::Wsl2Nat {
+            return self.schedule_wsl2_start();
+        }
         if self.config.server.is_local() {
             self.start_component(Component::Server).await?;
         } else {
@@ -967,9 +1039,20 @@ impl ControllerRuntime {
             }
             Component::Runner => {
                 let view = runner_view(&self.config.runner.config)?;
-                let server_url = configured_server_url(&self.config)?;
-                validate_runner_target(&view, &server_url)?;
-                self.stop_component(Component::Runner).await;
+                let server_url = if self.config.server.mode == ServerMode::Wsl2Nat {
+                    self.wsl2_startup
+                        .snapshot
+                        .effective_url
+                        .clone()
+                        .ok_or("wsl2_nat_target_unresolved")?
+                } else {
+                    let url = configured_server_url(&self.config)?;
+                    validate_runner_target(&view, &url)?;
+                    url
+                };
+                if self.config.server.mode != ServerMode::Wsl2Nat {
+                    self.stop_component(Component::Runner).await;
+                }
                 self.runner.phase = "starting";
                 let bin = super::discover_internal_binary("webcodex-runner").ok_or_else(|| {
                     "webcodex-runner was not found beside webcodex or in PATH".to_string()
@@ -983,9 +1066,16 @@ impl ControllerRuntime {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .kill_on_drop(true);
+                if self.config.server.mode == ServerMode::Wsl2Nat {
+                    wsl2_startup::configure_runner_command(&mut command, &server_url)?;
+                }
                 remove_controller_tunnel_credentials(&mut command);
                 self.runner.process =
                     Some(spawn_process(command, "runner", self.log.clone(), None)?);
+                if self.config.server.mode == ServerMode::Wsl2Nat {
+                    self.wsl2_startup.started_at = Some(Instant::now());
+                    return Ok(());
+                }
                 let online_verified = self.wait_runner_startup(&view, &server_url).await?;
                 self.runner.phase = runner_phase_after_start(online_verified);
             }
@@ -1038,6 +1128,9 @@ impl ControllerRuntime {
         Ok(())
     }
     async fn stop_component(&mut self, component: Component) {
+        if component == Component::Runner && self.config.server.mode == ServerMode::Wsl2Nat {
+            self.wsl2_startup.cancel();
+        }
         if component == Component::Server && !self.config.server.is_local() {
             self.server.phase = "remote";
             return;
@@ -1096,6 +1189,10 @@ impl ControllerRuntime {
                 self.stop_component(Component::Runner).await;
                 self.stop_component(Component::Server).await;
                 self.start_all().await
+            }
+            Some(Component::Runner) if self.config.server.mode == ServerMode::Wsl2Nat => {
+                self.stop_component(Component::Runner).await;
+                self.schedule_wsl2_start()
             }
             Some(Component::Runner) => self.start_component(Component::Runner).await,
             Some(Component::Tunnel) => self.start_component(Component::Tunnel).await,
@@ -1164,6 +1261,9 @@ impl ControllerRuntime {
         }
     }
     async fn reap_and_recover(&mut self) {
+        if self.config.server.mode == ServerMode::Wsl2Nat {
+            self.poll_wsl2_start().await;
+        }
         for component in [Component::Server, Component::Runner, Component::Tunnel] {
             let target = match component {
                 Component::Server => &mut self.server,
@@ -1179,6 +1279,29 @@ impl ControllerRuntime {
             };
             target.process = None;
             target.phase = "failed";
+            if component == Component::Runner && self.config.server.mode == ServerMode::Wsl2Nat {
+                self.wsl2_startup.cancel();
+                if matches!(status.code(), Some(2 | 77 | 78)) {
+                    self.wsl2_startup.snapshot.error = Some(
+                        if status.code() == Some(77) {
+                            "runner_auth_failed"
+                        } else {
+                            "runner_configuration_failed"
+                        }
+                        .into(),
+                    );
+                    log_line(
+                        &self.log,
+                        "controller",
+                        self.wsl2_startup
+                            .snapshot
+                            .error
+                            .as_deref()
+                            .unwrap_or("runner_failed"),
+                    );
+                    continue;
+                }
+            }
             log_line(
                 &self.log,
                 "controller",
@@ -1193,6 +1316,25 @@ impl ControllerRuntime {
             }
             target.restart_count += 1;
             target.phase = "restarting";
+            if component == Component::Runner && self.config.server.mode == ServerMode::Wsl2Nat {
+                match self.schedule_wsl2_start() {
+                    Ok(()) => {
+                        self.wsl2_startup.retry_at = Some(
+                            Instant::now()
+                                + Duration::from_secs(
+                                    self.config.controller.restart_delay_secs.min(30),
+                                ),
+                        )
+                    }
+                    Err(error) => {
+                        log_line(&self.log, "controller", error);
+                        self.wsl2_startup.snapshot.error =
+                            Some("runner_configuration_failed".into());
+                        self.runner.phase = "failed";
+                    }
+                }
+                continue;
+            }
             tokio::time::sleep(Duration::from_secs(
                 self.config.controller.restart_delay_secs,
             ))
@@ -1220,6 +1362,9 @@ fn render_default_config() -> Result<String, String> {
             env_file: Some(home.join(".config/webcodex/webcodex.env")),
             url: None,
             enabled: None,
+            interface: None,
+            scheme: None,
+            port: None,
         },
         runner: RunnerSettings {
             enabled: true,
@@ -1260,6 +1405,7 @@ fn doctor_report(config: &ControllerConfig, environment_file: &Path) -> Result<V
     let server_ok = match config.server.mode {
         ServerMode::Local => server_env && server_url.is_some() && server_bin == Some(true),
         ServerMode::Remote => server_url.is_some(),
+        ServerMode::Wsl2Nat => false,
     };
     let ok = server_ok
         && (!config.runner.enabled
@@ -1288,6 +1434,26 @@ fn doctor_report(config: &ControllerConfig, environment_file: &Path) -> Result<V
         },
         "existing_service_conflicts": service_conflicts
     }))
+}
+
+fn wsl2_target_text(report: &Value) -> String {
+    let Some(target) = report
+        .get("wsl2_nat_target")
+        .filter(|value| value.is_object())
+    else {
+        return String::new();
+    };
+    format!(
+        "WSL2 NAT target: {} ({})\nDiscovery: {} / {}\n{}",
+        target["effective_url"].as_str().unwrap_or("unresolved"),
+        target["source"].as_str().unwrap_or("unknown"),
+        target["resolution_state"].as_str().unwrap_or("unknown"),
+        target["probe_state"].as_str().unwrap_or("unknown"),
+        target["error"]
+            .as_str()
+            .map(|error| format!("Error: {error}\n"))
+            .unwrap_or_default(),
+    )
 }
 
 #[cfg(unix)]
@@ -1346,9 +1512,14 @@ fn remove_stale_controller_socket(path: &Path) -> Result<(), String> {
 
 #[cfg(unix)]
 async fn ipc_call(socket: &Path, request: Value) -> Result<Value, String> {
-    let mut stream = UnixStream::connect(socket)
+    let stream = UnixStream::connect(socket)
         .await
         .map_err(|e| format!("Controller is not running at {}: {e}", socket.display()))?;
+    ipc_exchange(stream, request).await
+}
+
+#[cfg(unix)]
+async fn ipc_exchange(mut stream: UnixStream, request: Value) -> Result<Value, String> {
     stream
         .write_all(
             serde_json::to_string(&request)
@@ -1359,10 +1530,14 @@ async fn ipc_call(socket: &Path, request: Value) -> Result<Value, String> {
         .map_err(|e| e.to_string())?;
     stream.write_all(b"\n").await.map_err(|e| e.to_string())?;
     let mut line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut line)
+    let mut reader = BufReader::new(stream).take(65537);
+    tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line))
         .await
+        .map_err(|_| "Controller response timeout")?
         .map_err(|e| e.to_string())?;
+    if line.len() > 65536 || !line.ends_with('\n') {
+        return Err("invalid or oversized Controller response".into());
+    }
     serde_json::from_str(&line).map_err(|e| format!("invalid Controller response: {e}"))
 }
 #[cfg(unix)]
@@ -1457,10 +1632,24 @@ async fn follow_controller_logs<W: tokio::io::AsyncWrite + Unpin>(
 
 #[cfg(unix)]
 async fn handle_ipc(runtime: &mut ControllerRuntime, stream: UnixStream) -> Result<(), String> {
+    if stream
+        .peer_cred()
+        .map_err(|_| "Controller peer unavailable")?
+        .uid()
+        != unsafe { libc::geteuid() }
+    {
+        return Err("Controller IPC requires the same user".into());
+    }
     let (read, mut write) = stream.into_split();
     let mut line = String::new();
-    let mut read = BufReader::new(read);
-    read.read_line(&mut line).await.map_err(|e| e.to_string())?;
+    let mut read = BufReader::new(read).take(8193);
+    tokio::time::timeout(Duration::from_secs(1), read.read_line(&mut line))
+        .await
+        .map_err(|_| "Controller request timeout")?
+        .map_err(|e| e.to_string())?;
+    if line.len() > 8192 || !line.ends_with('\n') {
+        return Err("invalid or oversized Controller request".into());
+    }
     let req: IpcRequest =
         serde_json::from_str(&line).map_err(|e| format!("invalid Controller request: {e}"))?;
     let result = match req.method.as_str() {
@@ -1790,17 +1979,26 @@ pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result
         } => {
             let cfg = read_config(&config)?;
             let report = doctor_report(&cfg, &environment_file)?;
+            #[cfg(unix)]
+            let report = {
+                let mut report = report;
+                if cfg.server.mode == ServerMode::Wsl2Nat {
+                    wsl2_startup::doctor(&cfg, &mut report).await?;
+                }
+                report
+            };
             if as_json {
                 return serde_json::to_string_pretty(&report).map_err(|e| e.to_string());
             }
             Ok(format!(
-                "Controller doctor: {}\nServer: {}\nRunner: {}\nTunnel: {}\n",
+                "Controller doctor: {}\nServer: {}\nRunner: {}\nTunnel: {}\n{}",
                 if report["ok"].as_bool() == Some(true) {
                     "PASS"
                 } else {
                     "FAIL"
                 },
                 match report["server"]["mode"].as_str() {
+                    Some("wsl2_nat") if report["server"]["url"].as_str().is_some() => "wsl2_nat",
                     Some("remote") if report["server"]["url"].as_str().is_some() => "remote",
                     Some("local")
                         if report["server"]["env_file"].as_bool() == Some(true)
@@ -1827,6 +2025,7 @@ pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result
                 } else {
                     "credentials missing"
                 },
+                wsl2_target_text(&report),
             ))
         }
         ControllerCommand::Run { config } => {
@@ -1893,7 +2092,7 @@ pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result
                             .map_err(|e| e.to_string());
                         }
                         return Ok(format!(
-                            "Controller: {}\nMode: {}\nServer: {}\nRunner: {}\nTunnel: {}\nService: {} / {}\n",
+                            "Controller: {}\nMode: {}\nServer: {}\nRunner: {}\nTunnel: {}\nService: {} / {}\n{}",
                             result["controller"].as_str().unwrap_or("unknown"),
                             source,
                             result["server"]["phase"].as_str().unwrap_or("unknown"),
@@ -1901,6 +2100,7 @@ pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result
                             result["tunnel"]["phase"].as_str().unwrap_or("unknown"),
                             service.active,
                             service.enabled,
+                            wsl2_target_text(result),
                         ));
                     }
                 }
@@ -2130,6 +2330,9 @@ mod tests {
                 env_file: Some("/tmp/server.env".into()),
                 url: None,
                 enabled: None,
+                interface: None,
+                scheme: None,
+                port: None,
             },
             runner: RunnerSettings {
                 enabled: false,
@@ -2154,6 +2357,9 @@ mod tests {
                 env_file: None,
                 url: Some("https://runtime.example.test".into()),
                 enabled: None,
+                interface: None,
+                scheme: None,
+                port: None,
             },
             runner: RunnerSettings {
                 enabled: true,
@@ -2294,6 +2500,9 @@ mod tests {
                 env_file: Some("/tmp/server.env".into()),
                 url: None,
                 enabled: None,
+                interface: None,
+                scheme: None,
+                port: None,
             },
             runner: RunnerSettings {
                 enabled: false,
