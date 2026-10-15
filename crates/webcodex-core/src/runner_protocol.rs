@@ -918,6 +918,12 @@ runner_capabilities! {
         #[serde(default, skip_serializing_if = "is_false")]
         pub browser_surface_handoff: bool = false;
     }
+    BrowserUserHandoff => RUNNER_CAPABILITY_BROWSER_USER_HANDOFF("browser_user_handoff"),
+    v2_baseline = false {
+        /// Exact managed visible Browser human handoff with automatic input fencing.
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub browser_user_handoff: bool = false;
+    }
     ComputerObserve => RUNNER_CAPABILITY_COMPUTER_OBSERVE("computer_observe"),
     v2_baseline = false {
         /// Native read-only desktop/window observation. Missing on older Runners
@@ -2924,6 +2930,7 @@ mod envelope_tests {
                 browser_extension_bridge: false,
                 browser_managed_profile: false,
                 browser_surface_handoff: false,
+                browser_user_handoff: false,
                 computer_observe: false,
                 computer_application_discovery: false,
                 computer_application_launch: false,

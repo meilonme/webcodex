@@ -430,7 +430,7 @@ fn goal_plan_persisted_progress_requires_checkpoint_and_monotonic_step_time() {
     for (status, step_time, checkpoint_time) in [
         ("completed", T0, None),
         ("in_progress", T0, None),
-        ("pending", T0 + 1, Some(T0 + 2)),
+        ("pending", T0 + 4, Some(T0 + 2)),
         ("completed", T0 + 2, Some(T0 + 1)),
     ] {
         let mut value = serde_json::to_value(&goal.plan).unwrap();
@@ -453,4 +453,522 @@ fn goal_plan_persisted_progress_requires_checkpoint_and_monotonic_step_time() {
             "goal_store_unavailable"
         );
     }
+}
+
+fn replacement(steps: &[(&str, &str)], reason: &str) -> GoalPlanReplacement {
+    GoalPlanReplacement {
+        reason: reason.into(),
+        steps: steps
+            .iter()
+            .map(|(id, title)| NewGoalStep {
+                id: (*id).into(),
+                title: (*title).into(),
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn revise_goal_plan_preserves_progress_records_prior_snapshot_and_survives_reopen() {
+    let (temp, db, owner) = fixture();
+    let goal = db.create_goal_at(&owner, input("create"), T0).unwrap().goal;
+    let id = &goal.summary.goal_id;
+    let checkpointed = db
+        .checkpoint_goal_at(
+            &owner,
+            id,
+            1,
+            checkpoint(&["inspect"], Some("implement"), "Inspected"),
+            "progress",
+            T0 + 1,
+        )
+        .unwrap()
+        .goal;
+    let request = replacement(
+        &[
+            ("new", "New validation"),
+            ("inspect", "inspect"),
+            ("implement", "Adapt implementation"),
+        ],
+        "New evidence",
+    );
+    let revised = db
+        .revise_goal_plan_at(&owner, id, 2, request.clone(), "revise", T0 + 2)
+        .unwrap();
+    assert_eq!(revised.goal.summary.revision, 3);
+    assert_eq!(revised.goal.plan.steps[0].status, GoalStepStatus::Pending);
+    assert_eq!(revised.goal.plan.steps[0].updated_at_unix_ms, T0 + 2);
+    assert_eq!(revised.goal.plan.steps[1], checkpointed.plan.steps[0]);
+    assert_eq!(revised.goal.plan.current_step().unwrap().id, "implement");
+    assert_eq!(revised.goal.plan.steps[2].updated_at_unix_ms, T0 + 1);
+    assert_eq!(
+        revised.goal.plan.completion_conditions,
+        checkpointed.plan.completion_conditions
+    );
+    assert_eq!(
+        revised.goal.plan.progress_summary,
+        checkpointed.plan.progress_summary
+    );
+    let history = &revised.goal.plan_history;
+    assert_eq!(
+        (
+            history.total_count,
+            history.returned_count,
+            history.truncated
+        ),
+        (1, 1, false)
+    );
+    assert_eq!(history.revisions[0].plan, checkpointed.plan);
+    assert_eq!(history.revisions[0].revision, 2);
+    assert_eq!(history.revisions[0].reason, "New evidence");
+    drop(db);
+    let db = Database::open(&temp.path().join("goal-plan.db")).unwrap();
+    assert_eq!(db.read_goal(&owner, id).unwrap(), revised.goal);
+    let replay = db
+        .revise_goal_plan_at(&owner, id, 2, request.clone(), "revise", T0 + 3)
+        .unwrap();
+    assert!(replay.replayed && !replay.state_changed);
+    assert_eq!(replay.goal, revised.goal);
+    let mut changed = request;
+    changed.steps.reverse();
+    assert_eq!(
+        db.revise_goal_plan_at(&owner, id, 2, changed, "revise", T0 + 4)
+            .unwrap_err()
+            .code(),
+        "goal_idempotency_conflict"
+    );
+    let removed = db
+        .revise_goal_plan_at(
+            &owner,
+            id,
+            3,
+            replacement(&[("inspect", "inspect")], "Drop unfinished work"),
+            "remove",
+            T0 + 4,
+        )
+        .unwrap();
+    assert!(removed.goal.plan.current_step().is_none());
+    assert!(removed.goal.plan.complete());
+}
+
+#[test]
+fn revise_goal_plan_invalid_replacements_and_stale_writes_are_atomic_and_private() {
+    let (_temp, db, owner) = fixture();
+    let id = db
+        .create_goal_at(&owner, input("create"), T0)
+        .unwrap()
+        .goal
+        .summary
+        .goal_id;
+    let current = db
+        .checkpoint_goal_at(
+            &owner,
+            &id,
+            1,
+            checkpoint(&["inspect"], Some("implement"), "Inspected"),
+            "progress",
+            T0 + 1,
+        )
+        .unwrap()
+        .goal;
+    let mut invalid = vec![
+        replacement(&[("implement", "implement")], "Remove completed"),
+        replacement(&[("inspect", "renamed")], "Rename completed"),
+        replacement(
+            &[("inspect", "inspect"), ("inspect", "duplicate")],
+            "Duplicate",
+        ),
+        replacement(&[("inspect", "inspect"), ("bad id", "bad")], "Invalid id"),
+        replacement(&[("inspect", "inspect"), ("new", "")], "Empty title"),
+        replacement(&[("inspect", "inspect")], " "),
+        replacement(&[("inspect", "inspect")], &"界".repeat(683)),
+        replacement(
+            &[("inspect", "inspect"), ("new", &"界".repeat(121))],
+            "Long title",
+        ),
+    ];
+    let mut too_many = replacement(&[], "Too many");
+    too_many.steps = (0..33)
+        .map(|i| NewGoalStep {
+            id: format!("s{i}"),
+            title: "s".into(),
+        })
+        .collect();
+    invalid.push(too_many);
+    for request in invalid {
+        assert_eq!(
+            db.revise_goal_plan_at(&owner, &id, 2, request, "invalid", T0 + 2)
+                .unwrap_err()
+                .code(),
+            "invalid_goal_plan"
+        );
+        assert_eq!(db.read_goal(&owner, &id).unwrap(), current);
+    }
+    let valid = replacement(&[("inspect", "inspect")], "Trim unfinished");
+    let stale = db
+        .revise_goal_plan_at(&owner, &id, 1, valid.clone(), "stale", T0 + 2)
+        .unwrap_err();
+    assert_eq!(stale.code(), "goal_revision_changed");
+    assert_eq!(stale.current_revision(), Some(2));
+    let foreign = CommunicationPrincipal {
+        digest: format!("{COMMUNICATION_PRINCIPAL_DIGEST_PREFIX}{}", "b".repeat(64)),
+        ..owner.clone()
+    };
+    assert_eq!(
+        db.revise_goal_plan_at(&foreign, &id, 2, valid.clone(), "foreign", T0 + 2)
+            .unwrap_err()
+            .code(),
+        "goal_not_found"
+    );
+    let accepted = db
+        .revise_goal_plan_at(&owner, &id, 2, valid, "invalid", T0 + 2)
+        .unwrap();
+    assert_eq!(
+        accepted.goal.plan_history.total_count, 1,
+        "failed validations must not consume a key or retain history"
+    );
+}
+
+#[test]
+fn revise_goal_plan_history_retention_and_terminal_replay() {
+    let (_temp, db, owner) = fixture();
+    let id = db
+        .create_goal_at(&owner, input("create"), T0)
+        .unwrap()
+        .goal
+        .summary
+        .goal_id;
+    for i in 1..=12 {
+        let result = db
+            .revise_goal_plan_at(
+                &owner,
+                &id,
+                i,
+                replacement(&[("inspect", "inspect")], &format!("Revision {i}")),
+                &format!("revision-{i}"),
+                T0 + i,
+            )
+            .unwrap();
+        let history = result.goal.plan_history;
+        assert_eq!(history.total_count, i);
+        assert_eq!(history.returned_count, (i as usize).min(8));
+        assert_eq!(history.truncated, i > 8);
+        assert_eq!(history.revisions[0].revision, i);
+    }
+    let stored: i64 = db
+        .lock_connection(crate::StoreDomain::Goal)
+        .query_row(
+            "SELECT COUNT(*) FROM wc_goal_plan_revisions WHERE goal_id = ?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, 8);
+    let cancelled = db
+        .update_goal_at(
+            &owner,
+            &id,
+            13,
+            GoalPatch {
+                lifecycle: Some(GoalLifecycle::Cancelled),
+                ..Default::default()
+            },
+            "cancel",
+            T0 + 13,
+        )
+        .unwrap()
+        .goal;
+    assert_eq!(
+        db.revise_goal_plan_at(
+            &owner,
+            &id,
+            14,
+            replacement(&[], "Terminal"),
+            "terminal",
+            T0 + 14
+        )
+        .unwrap_err()
+        .code(),
+        "goal_terminal"
+    );
+    let replay = db
+        .revise_goal_plan_at(
+            &owner,
+            &id,
+            1,
+            replacement(&[("inspect", "inspect")], "Revision 1"),
+            "revision-1",
+            T0 + 15,
+        )
+        .unwrap();
+    assert!(replay.replayed && !replay.state_changed);
+    assert_eq!(
+        replay.goal, cancelled,
+        "pruning history must not prune replay identity"
+    );
+}
+
+#[test]
+fn revise_goal_plan_competing_connections_serialize_and_failed_history_insert_rolls_back() {
+    let (temp, db, owner) = fixture();
+    let id = db
+        .create_goal_at(&owner, input("create"), T0)
+        .unwrap()
+        .goal
+        .summary
+        .goal_id;
+    let other = Database::open(&temp.path().join("goal-plan.db")).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let handles: Vec<_> = [db, other]
+        .into_iter()
+        .enumerate()
+        .map(|(i, db)| {
+            let (owner, id, barrier) = (owner.clone(), id.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.revise_goal_plan_at(
+                    &owner,
+                    &id,
+                    1,
+                    replacement(&[("new", "new")], "Race"),
+                    &format!("race-{i}"),
+                    T0 + 1,
+                )
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .find_map(|r| r.as_ref().err())
+            .unwrap()
+            .code(),
+        "goal_revision_changed"
+    );
+    let db = Database::open(&temp.path().join("goal-plan.db")).unwrap();
+    let before = db.read_goal(&owner, &id).unwrap();
+    db.lock_connection(crate::StoreDomain::Goal).execute_batch("CREATE TRIGGER reject_plan_history BEFORE INSERT ON wc_goal_plan_revisions BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+    assert_eq!(
+        db.revise_goal_plan_at(
+            &owner,
+            &id,
+            2,
+            replacement(&[], "Fail atomically"),
+            "failure",
+            T0 + 2
+        )
+        .unwrap_err()
+        .code(),
+        "goal_store_unavailable"
+    );
+    assert_eq!(db.read_goal(&owner, &id).unwrap(), before);
+    // Fail after plan/history mutation, proving the same transaction rolls them back.
+    db.lock_connection(crate::StoreDomain::Goal).execute_batch("DROP TRIGGER reject_plan_history; CREATE TRIGGER reject_plan_replay BEFORE INSERT ON wc_goal_idempotency WHEN NEW.operation = 'revise_goal_plan' BEGIN SELECT RAISE(ABORT, 'injected replay failure'); END;").unwrap();
+    assert_eq!(
+        db.revise_goal_plan_at(
+            &owner,
+            &id,
+            2,
+            replacement(&[], "Fail replay atomically"),
+            "late-failure",
+            T0 + 2
+        )
+        .unwrap_err()
+        .code(),
+        "goal_store_unavailable"
+    );
+    assert_eq!(db.read_goal(&owner, &id).unwrap(), before);
+}
+
+#[test]
+fn revise_goal_plan_large_history_read_budget_and_corrupt_rows_fail_closed() {
+    let (_temp, db, owner) = fixture();
+    let mut large = input("large");
+    large.steps = (0..32)
+        .map(|i| NewGoalStep {
+            id: format!("step{i}"),
+            title: "😀".repeat(120),
+        })
+        .collect();
+    large.completion_conditions = vec!["c".repeat(512); 8];
+    let id = db
+        .create_goal_at(&owner, large.clone(), T0)
+        .unwrap()
+        .goal
+        .summary
+        .goal_id;
+    for i in 1..=8 {
+        db.revise_goal_plan_at(
+            &owner,
+            &id,
+            i,
+            GoalPlanReplacement {
+                steps: large.steps.clone(),
+                reason: "r".repeat(2048),
+            },
+            &format!("large-{i}"),
+            T0 + i,
+        )
+        .unwrap();
+    }
+    let goal = db.read_goal(&owner, &id).unwrap();
+    assert_eq!(goal.plan_history.total_count, 8);
+    assert!(goal.plan_history.returned_count < 8 && goal.plan_history.returned_count > 0);
+    assert!(goal.plan_history.truncated);
+    let bytes: usize = goal
+        .plan_history
+        .revisions
+        .iter()
+        .map(|r| serde_json::to_vec(r).unwrap().len())
+        .sum();
+    assert!(bytes <= MAX_GOAL_PLAN_HISTORY_READ_BYTES);
+    assert!(
+        serde_json::to_vec(&goal).unwrap().len()
+            < MAX_GOAL_PLAN_HISTORY_READ_BYTES + MAX_GOAL_PLAN_BYTES + 12_288
+    );
+    // Even an old snapshot omitted by the presentation budget must fail closed if corrupt.
+    db.lock_connection(crate::StoreDomain::Goal)
+        .execute(
+            "UPDATE wc_goal_plan_revisions SET plan_json = ?2 WHERE goal_id = ?1 AND revision = 1",
+            params![id, "x".repeat(MAX_GOAL_PLAN_BYTES + 1)],
+        )
+        .unwrap();
+    assert_eq!(
+        db.read_goal(&owner, &id).unwrap_err().code(),
+        "goal_store_unavailable"
+    );
+}
+
+#[test]
+fn revise_goal_plan_cannot_mutate_completed_goal_or_resurrect_progress() {
+    let (_temp, db, owner) = fixture();
+    let id = db
+        .create_goal_at(&owner, input("create"), T0)
+        .unwrap()
+        .goal
+        .summary
+        .goal_id;
+    let request = replacement(&[("inspect", "inspect")], "Reduce unfinished plan");
+    db.revise_goal_plan_at(&owner, &id, 1, request.clone(), "revision", T0 + 1)
+        .unwrap();
+    db.checkpoint_goal_at(
+        &owner,
+        &id,
+        2,
+        checkpoint(&["inspect"], None, "Validation and review passed"),
+        "finish-progress",
+        T0 + 2,
+    )
+    .unwrap();
+    let terminal = db
+        .update_goal_at(
+            &owner,
+            &id,
+            3,
+            GoalPatch {
+                lifecycle: Some(GoalLifecycle::Completed),
+                ..Default::default()
+            },
+            "finish",
+            T0 + 3,
+        )
+        .unwrap()
+        .goal;
+    assert_eq!(
+        db.revise_goal_plan_at(
+            &owner,
+            &id,
+            4,
+            replacement(&[("new", "new")], "Attempt resurrection"),
+            "after-completion",
+            T0 + 4
+        )
+        .unwrap_err()
+        .code(),
+        "goal_terminal"
+    );
+    assert_eq!(
+        db.revise_goal_plan_at(&owner, &id, 1, request, "revision", T0 + 5)
+            .unwrap()
+            .goal,
+        terminal
+    );
+}
+
+#[test]
+fn revise_goal_plan_additive_migration_preserves_existing_goal_without_history() {
+    let (temp, db, owner) = fixture();
+    let goal = db
+        .create_goal_at(&owner, input("pre-history-create"), T0)
+        .unwrap()
+        .goal;
+    // Reproduce the exact pre-revision Goal schema, retaining its canonical plan.
+    db.lock_connection(crate::StoreDomain::Goal).execute_batch(
+        "DROP TABLE wc_goal_plan_revisions; ALTER TABLE wc_goals DROP COLUMN plan_revision_count;"
+    ).unwrap();
+    drop(db);
+    let db = Database::open(&temp.path().join("goal-plan.db")).unwrap();
+    assert_eq!(db.read_goal(&owner, &goal.summary.goal_id).unwrap(), goal);
+    let revised = db
+        .revise_goal_plan_at(
+            &owner,
+            &goal.summary.goal_id,
+            1,
+            replacement(&[("new", "New step")], "Plan after upgrade"),
+            "post-upgrade-revise",
+            T0 + 1,
+        )
+        .unwrap();
+    assert_eq!(revised.goal.plan_history.total_count, 1);
+    assert_eq!(revised.goal.plan_history.revisions[0].plan, goal.plan);
+}
+
+#[test]
+fn revise_goal_plan_reads_pin_current_plan_and_history_to_one_snapshot() {
+    let (temp, db, owner) = fixture();
+    let id = db
+        .create_goal_at(&owner, input("create"), T0)
+        .unwrap()
+        .goal
+        .summary
+        .goal_id;
+    let writer = Database::open(&temp.path().join("goal-plan.db")).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let handle = {
+        let (owner, id, barrier) = (owner.clone(), id.clone(), barrier.clone());
+        std::thread::spawn(move || {
+            barrier.wait();
+            for revision in 1..=16 {
+                writer
+                    .revise_goal_plan_at(
+                        &owner,
+                        &id,
+                        revision,
+                        replacement(&[("inspect", "inspect")], "Concurrent revision"),
+                        &format!("revision-{revision}"),
+                        T0 + revision,
+                    )
+                    .unwrap();
+            }
+        })
+    };
+    barrier.wait();
+    for _ in 0..64 {
+        let goal = db.read_goal(&owner, &id).unwrap();
+        assert_eq!(goal.plan_history.total_count + 1, goal.summary.revision);
+        if let Some(prior) = goal.plan_history.revisions.first() {
+            assert_eq!(prior.revision + 1, goal.summary.revision);
+        }
+        assert_eq!(
+            db.list_goals(&owner, None, None, 0, 10)
+                .unwrap()
+                .goals
+                .len(),
+            1
+        );
+    }
+    handle.join().unwrap();
+    assert_eq!(db.read_goal(&owner, &id).unwrap().summary.revision, 17);
 }

@@ -381,9 +381,10 @@ pub(super) fn mcp_tools_list_payload_with_features_for_auth(
             let agent_continuation_tool = is_agent_continuation_app_tool_name(&spec.name);
             let job_terminal_continuation_tool =
                 is_job_terminal_continuation_app_tool_name(&spec.name);
+            let goal_sync_tool = spec.name == "sync_goal_plan";
             let mut value = mcp_tool_descriptor_json(spec, compact, false, None);
             attach_app_visibility(&mut value);
-            if agent_continuation_tool || job_terminal_continuation_tool {
+            if agent_continuation_tool || job_terminal_continuation_tool || goal_sync_tool {
                 // Bridge helpers return data to an existing View; they never
                 // render another widget. Private rendering tools are rejected
                 // by ChatGPT during discovery/refresh.
@@ -958,6 +959,10 @@ fn is_host_continuation_app_tool_name(tool_name: &str) -> bool {
         || is_job_terminal_continuation_app_tool_name(tool_name)
 }
 
+fn is_diagnostic_app_tool_name(tool_name: &str) -> bool {
+    is_host_continuation_app_tool_name(tool_name) || tool_name == "sync_goal_plan"
+}
+
 const AGENT_CONTINUATION_APP_CALL_ID_FIELD: &str = "app_call_id";
 const AGENT_CONTINUATION_APP_CALL_ID_PATTERN: &str = "^wc_app_call_[0-9a-f]{16}_[1-9][0-9]{0,5}$";
 
@@ -980,7 +985,7 @@ fn valid_agent_continuation_app_call_id(value: &str) -> bool {
 
 pub(super) fn agent_continuation_app_call_id_from_params(params: &Value) -> Option<String> {
     let name = params.get("name").and_then(Value::as_str)?;
-    if !is_host_continuation_app_tool_name(name) {
+    if !is_diagnostic_app_tool_name(name) {
         return None;
     }
     let value = params
@@ -1081,6 +1086,9 @@ fn log_agent_continuation_app_result(
     let output = structured
         .and_then(|structured| structured.get("output"))
         .and_then(Value::as_object);
+    if let Some(output) = result.pointer("/structuredContent/output") {
+        lifecycle.capture_continuation_ids(output);
+    }
     let projection = output
         .and_then(|output| output.get("agent_continuation"))
         .and_then(Value::as_object)

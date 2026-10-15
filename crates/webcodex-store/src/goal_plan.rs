@@ -1,4 +1,4 @@
-//! Bounded mechanical progress for a durable Goal. The fixed plan is not a
+//! Bounded mechanical progress for a durable Goal. The plan is not a
 //! scheduler, and natural-language completion intent is never evaluated here.
 use super::goal::GoalStoreError;
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,52 @@ pub const MAX_GOAL_COMPLETION_CONDITIONS: usize = 8;
 pub const MAX_GOAL_CONDITION_BYTES: usize = 512;
 pub const MAX_GOAL_PROGRESS_SUMMARY_BYTES: usize = 2_048;
 pub const MAX_GOAL_PLAN_BYTES: usize = 32_768;
+pub const MAX_GOAL_PLAN_REVISIONS: usize = 8;
+pub const MAX_GOAL_PLAN_REVISION_REASON_BYTES: usize = 2_048;
+pub const MAX_GOAL_PLAN_HISTORY_READ_BYTES: usize = 65_536;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GoalPlanRevision {
+    pub revision: i64,
+    pub revised_at_unix_ms: i64,
+    pub reason: String,
+    pub plan: GoalPlan,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct GoalPlanHistory {
+    pub total_count: i64,
+    pub returned_count: usize,
+    pub truncated: bool,
+    pub revisions: Vec<GoalPlanRevision>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GoalPlanReplacement {
+    pub reason: String,
+    pub steps: Vec<NewGoalStep>,
+}
+
+impl GoalPlanReplacement {
+    pub(super) fn normalized(mut self) -> Result<Self, GoalStoreError> {
+        self.reason = self.reason.trim().to_string();
+        if self.reason.is_empty() || self.reason.len() > MAX_GOAL_PLAN_REVISION_REASON_BYTES {
+            return Err(plan_error(
+                "Revision reason must contain 1..=2048 UTF-8 bytes",
+            ));
+        }
+        // Reuse the canonical step bounds and normalization before hashing or mutation.
+        self.steps = GoalPlan::new(Vec::new(), self.steps, 0)?
+            .steps
+            .into_iter()
+            .map(|step| NewGoalStep {
+                id: step.id,
+                title: step.title,
+            })
+            .collect();
+        Ok(self)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -193,6 +239,50 @@ impl GoalPlan {
         Ok(plan)
     }
 
+    pub(super) fn replace_steps(
+        &self,
+        replacement: &GoalPlanReplacement,
+        now: i64,
+    ) -> Result<Self, GoalStoreError> {
+        for completed in self
+            .steps
+            .iter()
+            .filter(|step| step.status == GoalStepStatus::Completed)
+        {
+            if !replacement
+                .steps
+                .iter()
+                .any(|step| step.id == completed.id && step.title == completed.title)
+            {
+                return Err(plan_error(
+                    "Completed steps must retain their exact id and title",
+                ));
+            }
+        }
+        let mut plan = self.clone();
+        plan.steps = replacement
+            .steps
+            .iter()
+            .map(|input| {
+                if let Some(existing) = self.steps.iter().find(|step| step.id == input.id) {
+                    GoalStep {
+                        title: input.title.clone(),
+                        ..existing.clone()
+                    }
+                } else {
+                    GoalStep {
+                        id: input.id.clone(),
+                        title: input.title.clone(),
+                        status: GoalStepStatus::Pending,
+                        updated_at_unix_ms: now,
+                    }
+                }
+            })
+            .collect();
+        plan.persisted_json()?;
+        Ok(plan)
+    }
+
     pub(super) fn persisted_json(&self) -> Result<String, GoalStoreError> {
         let json = serde_json::to_string(self)
             .map_err(|_| plan_error("Goal plan serialization failed"))?;
@@ -267,15 +357,10 @@ impl GoalPlan {
                     "Goal step timestamp is outside its Goal revision",
                 ));
             }
-            if step.status == GoalStepStatus::Pending {
-                if step.updated_at_unix_ms != created_at {
-                    return Err(plan_error(
-                        "A pending step cannot have a progress timestamp",
-                    ));
-                }
-            } else if self
-                .checkpoint_at_unix_ms
-                .is_none_or(|checkpoint| step.updated_at_unix_ms > checkpoint)
+            if step.status != GoalStepStatus::Pending
+                && self
+                    .checkpoint_at_unix_ms
+                    .is_none_or(|checkpoint| step.updated_at_unix_ms > checkpoint)
             {
                 return Err(plan_error(
                     "Progress requires a durable checkpoint at or after the step transition",

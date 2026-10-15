@@ -223,6 +223,7 @@ fn goal_tools_are_control_only_and_never_declare_execution_authority() {
         "present_goal_plan",
         "list_goals",
         "update_goal",
+        "revise_goal_plan",
         "associate_goal_agent_task",
         "associate_goal_workflow_session",
     ] {
@@ -257,7 +258,12 @@ fn goal_tools_are_control_only_and_never_declare_execution_authority() {
         );
     }
 
-    for name in ["create_goal", "update_goal", "associate_goal_agent_task"] {
+    for name in [
+        "create_goal",
+        "update_goal",
+        "revise_goal_plan",
+        "associate_goal_agent_task",
+    ] {
         let definition = lookup_tool_definition(name).unwrap();
         assert_eq!(definition.metadata.effect, ToolEffect::Mutate);
         assert_eq!(definition.metadata.risk, ToolRisk::WorkflowManage);
@@ -351,6 +357,53 @@ fn goal_schemas_are_bounded_private_and_existing_coding_tools_do_not_accept_goal
         .unwrap()
         .iter()
         .any(|field| field == "controller_agent_id"));
+
+    let revise = spec("revise_goal_plan");
+    assert_eq!(revise.input_schema["properties"]["steps"]["maxItems"], 32);
+    assert_eq!(
+        revise.input_schema["properties"]["reason"]["maxLength"],
+        2048
+    );
+    assert_eq!(
+        revise.input_schema["properties"]["expected_revision"]["minimum"],
+        1
+    );
+    assert_eq!(revise.input_schema["additionalProperties"], false);
+    for field in [
+        "goal_id",
+        "expected_revision",
+        "steps",
+        "reason",
+        "idempotency_key",
+    ] {
+        assert!(revise.input_schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|required| required == field));
+    }
+    for forbidden in [
+        "completion_conditions",
+        "objective",
+        "current_step_id",
+        "controller_agent_id",
+        "session_id",
+        "project",
+        "window",
+        "endpoint_id",
+    ] {
+        assert!(revise.input_schema["properties"].get(forbidden).is_none());
+    }
+    let history = &revise.output_schema["properties"]["output"]["properties"]["goal"]["properties"]
+        ["plan_history"];
+    assert_eq!(history["properties"]["revisions"]["maxItems"], 8);
+    for field in ["total_count", "returned_count", "truncated", "revisions"] {
+        assert!(history["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|required| required == field));
+    }
 
     let prepare = spec("prepare_goal_workflow");
     assert_eq!(

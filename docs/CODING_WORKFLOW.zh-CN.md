@@ -7,6 +7,21 @@ Workflow Session 属于该 runtime。使用其他 Host 的工具在本地开发 
 请遵循 [CONTRIBUTING.md](../CONTRIBUTING.zh-CN.md) 和 [AGENTS.md](../AGENTS.md)，
 无需为了贡献代码而先安装 WebCodex。
 
+## 计划后继续执行
+
+对于复杂开发任务，先调查相关规则与代码，明确可观察的完成条件，展示按结果组织的简短计划，
+随后继续已授权的实现；不要仅为了询问“是否开始”而停下。只有缺少实质需求或权限时才提问。
+小任务无需计划；可见计划不要求创建持久 Goal，现有 Goal 选择偏好保持不变。
+
+下一步由实际工具结果决定。证据推翻假设或用户修改要求时，调整剩余方案，并在已建立的
+Session 中保留有用的决策与进度。不要预先完成测试，不要没有新诊断就重复相同失败。
+每次执行保留同一个 Job；读取截断沿返回的 continuation 继续，陈旧编辑先重新读取，
+效果不确定时先核对而不是重放。
+
+Project selector 被拒绝属于输入校验，不证明 Runner 离线，也不证明必须已有 Session。
+已注册项目使用 canonical id 或已签发的 `project_ref`；未知时先授权调用 `list_projects`，
+不要从文件路径猜测 Runner。`client_id + path` 仍是显式 bootstrap 方式，权限边界不变。
+
 ## 普通循环
 
 日常 WebCodex coding loop 应该保持很小：

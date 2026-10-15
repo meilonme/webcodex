@@ -278,10 +278,11 @@ mod project_reference_tests;
 mod job_receipts_tests;
 
 pub use goal_plan::{
-    GoalCheckpoint, GoalPlan, GoalStep, GoalStepStatus, NewGoalStep,
-    MAX_GOAL_COMPLETION_CONDITIONS, MAX_GOAL_CONDITION_BYTES, MAX_GOAL_PLAN_BYTES,
-    MAX_GOAL_PROGRESS_SUMMARY_BYTES, MAX_GOAL_STEPS, MAX_GOAL_STEP_ID_BYTES,
-    MAX_GOAL_STEP_TITLE_CHARS,
+    GoalCheckpoint, GoalPlan, GoalPlanHistory, GoalPlanReplacement, GoalPlanRevision, GoalStep,
+    GoalStepStatus, NewGoalStep, MAX_GOAL_COMPLETION_CONDITIONS, MAX_GOAL_CONDITION_BYTES,
+    MAX_GOAL_PLAN_BYTES, MAX_GOAL_PLAN_HISTORY_READ_BYTES, MAX_GOAL_PLAN_REVISIONS,
+    MAX_GOAL_PLAN_REVISION_REASON_BYTES, MAX_GOAL_PROGRESS_SUMMARY_BYTES, MAX_GOAL_STEPS,
+    MAX_GOAL_STEP_ID_BYTES, MAX_GOAL_STEP_TITLE_CHARS,
 };
 
 pub use goal_stall::{

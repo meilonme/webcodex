@@ -178,6 +178,17 @@ fn runner_config_control_capability_is_platform_neutral() {
 }
 
 #[test]
+fn browser_user_handoff_capability_requires_owned_browser_and_exact_native_surface() {
+    let capabilities = runner_register_capabilities(&test_config(PathBuf::new()));
+    if !cfg!(any(target_os = "macos", windows))
+        || !capabilities.browser_managed_profile
+        || !capabilities.browser_surface_handoff
+    {
+        assert!(!capabilities.browser_user_handoff);
+    }
+}
+
+#[test]
 fn pointer_capability_matches_supported_native_backends() {
     let capabilities = runner_register_capabilities(&test_config(PathBuf::new()));
     assert_eq!(

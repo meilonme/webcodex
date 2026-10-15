@@ -7,6 +7,28 @@ names and Workflow Sessions belong to that runtime. For local development of the
 WebCodex repository with another host's tools, follow [CONTRIBUTING.md](../CONTRIBUTING.md)
 and [AGENTS.md](../AGENTS.md). This guide does not require installing WebCodex to contribute.
 
+## Plan and continue
+
+For substantial development, first inspect relevant rules/code and define observable
+completion conditions. Show a short plan organized by outcomes, then continue
+with authorized implementation; do not stop merely to ask whether to proceed.
+Ask only when a material requirement or authority is missing. Tiny work needs no
+plan, and a visible plan does not require a durable Goal. Existing Goal selection
+preferences remain unchanged.
+
+Choose the next action from actual tool results. Revise the remaining approach
+when evidence disproves a hypothesis or the user changes requirements; retain
+useful decisions/progress in the established Session. Never pre-complete tests or
+repeat the same failure without new diagnosis. Keep one Job for each execution.
+A truncated read uses its returned continuation, a stale edit needs a fresh read,
+and an uncertain effect needs reconciliation rather than replay.
+
+A Project selector rejection is input validation, not proof of an offline Runner
+or a missing Session. For an already registered Project use its canonical id or
+issued `project_ref`. If unknown, use authorized `list_projects` discovery; do not
+guess a Runner from a filesystem path. `client_id + path` remains an explicit
+bootstrap form, with the same authorization as before.
+
 ## Normal loop
 
 The ordinary WebCodex coding loop is intentionally small:

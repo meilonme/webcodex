@@ -122,7 +122,7 @@ impl ParsedCall {
         if params.name == "search_mentions" {
             return Err(search_mentions(context, params.arguments).await);
         }
-        let app_call_id = if stateless_2026 && is_host_continuation_app_tool_name(&params.name) {
+        let app_call_id = if stateless_2026 && is_diagnostic_app_tool_name(&params.name) {
             match strip_agent_continuation_app_call_id(&mut params.arguments) {
                 Ok(app_call_id) => app_call_id,
                 Err(message) => {

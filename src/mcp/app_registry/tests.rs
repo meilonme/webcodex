@@ -9,8 +9,8 @@ fn bundled_app_registry_has_unique_exact_identities_and_stable_discovery() {
         "ui://webcodex/computer/v12",
         "ui://webcodex/workbench/v3",
         "ui://webcodex/work-result/v31",
-        "ui://webcodex/goal-plan/v7",
-        "ui://webcodex/agent-continuation/v20",
+        "ui://webcodex/goal-plan/v9",
+        "ui://webcodex/agent-continuation/v21",
         "ui://webcodex/job-terminal-continuation/v2",
         "ui://webcodex/docx/v2",
     ];
@@ -61,9 +61,12 @@ fn bundled_app_registry_has_unique_exact_identities_and_stable_discovery() {
         "ui://webcodex/work-result/v22",
         "ui://webcodex/work-result/v21",
         "ui://webcodex/goal-plan/v6",
+        "ui://webcodex/goal-plan/v7",
+        "ui://webcodex/goal-plan/v8",
         "ui://webcodex/agent-continuation/v17",
         "ui://webcodex/agent-continuation/v18",
         "ui://webcodex/agent-continuation/v19",
+        "ui://webcodex/agent-continuation/v20",
         "ui://webcodex/job-terminal-continuation/v1",
     ] {
         assert!(

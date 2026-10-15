@@ -65,6 +65,29 @@ impl ToolRuntime {
                 },
             ),
 
+            ToolCall::ReviseGoalPlan {
+                goal_id,
+                expected_revision,
+                steps,
+                reason,
+                idempotency_key,
+            } => self.revise_goal_plan(
+                auth,
+                goal_id,
+                expected_revision,
+                crate::db::GoalPlanReplacement {
+                    reason,
+                    steps: steps
+                        .into_iter()
+                        .map(|step| crate::db::NewGoalStep {
+                            id: step.id,
+                            title: step.title,
+                        })
+                        .collect(),
+                },
+                idempotency_key,
+            ),
+
             ToolCall::CheckpointGoal {
                 goal_id,
                 expected_revision,

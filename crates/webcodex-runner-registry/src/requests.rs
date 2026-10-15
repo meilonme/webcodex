@@ -2533,6 +2533,12 @@ impl RunnerRegistry {
                 RunnerFeature::BrowserLaunch,
                 RunnerFeature::BrowserManagedProfile,
             ],
+            BrowserKind::BeginUserHandoff | BrowserKind::FinishUserHandoff => &[
+                RunnerFeature::BrowserControl,
+                RunnerFeature::BrowserUserHandoff,
+                RunnerFeature::BrowserSurfaceHandoff,
+                RunnerFeature::ComputerObserve,
+            ],
             BrowserKind::ResolveSurface => &[
                 RunnerFeature::BrowserObserve,
                 RunnerFeature::BrowserSurfaceHandoff,

@@ -365,6 +365,12 @@ pub(crate) fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabili
             && cfg!(any(target_os = "macos", windows))
             && !super::super::computer_session::configured(),
     );
+    capabilities.set(
+        RunnerCapabilityId::BrowserUserHandoff,
+        owned_browser_available
+            && cfg!(any(target_os = "macos", windows))
+            && !super::super::computer_session::configured(),
+    );
     // Native read-only desktop observation is implemented only on macOS and
     // Windows. Unsupported platforms advertise false and fail closed.
     capabilities.set(

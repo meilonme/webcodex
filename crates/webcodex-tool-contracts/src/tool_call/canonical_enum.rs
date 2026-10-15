@@ -1875,7 +1875,7 @@ pub enum ToolCall {
         #[serde(default)]
         #[schemars(schema_with = "goal_conditions_schema")]
         completion_conditions: Vec<String>,
-        /// Fixed bounded plan. Stable ids are unique; all steps start pending.
+        /// Initial bounded plan. Stable ids are unique; all steps start pending.
         #[serde(default)]
         #[schemars(length(max = 32))]
         steps: Vec<GoalStepInputCall>,
@@ -1902,7 +1902,7 @@ pub enum ToolCall {
         #[serde(default)]
         #[schemars(schema_with = "goal_conditions_schema")]
         completion_conditions: Vec<String>,
-        /// Fixed bounded plan. Stable ids are unique; all steps start pending. Use checkpoint_goal
+        /// Initial bounded plan. Stable ids are unique; all steps start pending. Use checkpoint_goal
         /// for atomic progress at recovery-worthy milestones, not after every tool call.
         #[serde(default)]
         #[schemars(length(max = 32))]
@@ -1949,6 +1949,23 @@ pub enum ToolCall {
     GoalPlanSync {
         #[schemars(regex(pattern = "^wc_goal_[A-Za-z0-9_-]{16}$"))]
         goal_id: String,
+    },
+
+    /// Replace the full ordered plan of one exact owned active Goal without changing progress or completion intent.
+    ReviseGoalPlan {
+        #[schemars(regex(pattern = "^wc_goal_[A-Za-z0-9_-]{16}$"))]
+        goal_id: String,
+        #[schemars(range(min = 1))]
+        expected_revision: i64,
+        /// Full replacement. Completed ids/titles must remain, retained statuses are preserved, and new ids start pending.
+        #[schemars(length(max = 32))]
+        steps: Vec<GoalStepInputCall>,
+        /// Why the unfinished plan changed; additionally bounded to 2048 UTF-8 bytes.
+        #[schemars(length(min = 1, max = 2048))]
+        reason: String,
+        /// Exact replay is inert; changed reuse conflicts. Re-read get_goal after a stale revision.
+        #[schemars(length(min = 1, max = 128))]
+        idempotency_key: String,
     },
 
     /// Atomically checkpoint one Goal's mechanical plan and recovery summary.

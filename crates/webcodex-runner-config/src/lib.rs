@@ -351,6 +351,7 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             browser_launch: false,
             browser_managed_profile: false,
             browser_surface_handoff: false,
+            browser_user_handoff: false,
             browser_extension_bridge: false,
             // Desktop observation is a runtime/platform capability and is never
             // claimed by generated static config.

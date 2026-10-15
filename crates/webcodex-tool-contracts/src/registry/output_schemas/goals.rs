@@ -85,6 +85,28 @@ fn mechanical_plan_schema() -> Value {
     })
 }
 
+fn plan_history_schema() -> Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "properties": {
+            "total_count": {"type": "integer", "minimum": 0, "description": "All accepted plan revisions, including pruned snapshots."},
+            "returned_count": {"type": "integer", "minimum": 0, "maximum": 8},
+            "truncated": {"type": "boolean", "description": "True when retention or the 64 KiB history read budget omits prior snapshots."},
+            "revisions": {"type": "array", "maxItems": 8, "description": "Newest prior snapshots first; at most eight retained and at most 64 KiB of serialized entries returned.", "items": {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "revision": {"type": "integer", "minimum": 1},
+                    "revised_at_unix_ms": {"type": "integer"},
+                    "reason": {"type": "string", "minLength": 1, "maxLength": 2048},
+                    "plan": mechanical_plan_schema()
+                },
+                "required": ["revision", "revised_at_unix_ms", "reason", "plan"]
+            }}
+        },
+        "required": ["total_count", "returned_count", "truncated", "revisions"]
+    })
+}
+
 fn goal_detail_schema() -> Value {
     json!({
         "type": "object",
@@ -92,6 +114,7 @@ fn goal_detail_schema() -> Value {
         "properties": {
             "summary": goal_summary_schema(),
             "plan": mechanical_plan_schema(),
+            "plan_history": plan_history_schema(),
             "objective": {"type": "string", "minLength": 1, "maxLength": 8192, "description": "Bounded authoritative high-level objective/instruction; the Store enforces the same 8192-byte UTF-8 ceiling."},
             "controller_agent_id": nullable_controller_agent_id("Exact durable Goal attention-routing Agent, or null when no workflow-stall controller was specified. Identity only; it grants no Goal, Task, Project, Session, Runner, Endpoint, or execution authority."),
             "terminal_reason": {
@@ -108,7 +131,7 @@ fn goal_detail_schema() -> Value {
                 "description": "Bounded explicit AgentTask and Workflow Session correlations only. No target-domain authority or private target state is projected."
             }
         },
-        "required": ["summary", "plan", "objective", "controller_agent_id", "terminal_reason", "correlations"]
+        "required": ["summary", "plan", "plan_history", "objective", "controller_agent_id", "terminal_reason", "correlations"]
     })
 }
 
@@ -256,6 +279,7 @@ pub fn output_schema_for_tool(name: &str) -> Option<Value> {
         | "create_goal"
         | "update_goal"
         | "checkpoint_goal"
+        | "revise_goal_plan"
         | "associate_goal_agent_task"
         | "associate_goal_workflow_session" => goal_mutation_schema(),
         "get_goal" => wrapped_output_schema(vec![("goal", goal_detail_schema())]),
