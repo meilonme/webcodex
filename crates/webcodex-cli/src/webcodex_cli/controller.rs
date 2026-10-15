@@ -1520,6 +1520,14 @@ async fn ipc_call(socket: &Path, request: Value) -> Result<Value, String> {
 
 #[cfg(unix)]
 async fn ipc_exchange(mut stream: UnixStream, request: Value) -> Result<Value, String> {
+    // Status/control replies are small. A valid 500-line log tail can exceed
+    // 64 KiB; preserve a finite larger limit only for that explicit operation.
+    // Local restarts may include several child stops and readiness windows.
+    let (reply_limit, reply_timeout) = match request["method"].as_str() {
+        Some("logs") => (8 * 1024 * 1024usize, Duration::from_secs(3)),
+        Some("restart") => (65_536usize, Duration::from_secs(120)),
+        _ => (65_536usize, Duration::from_secs(3)),
+    };
     stream
         .write_all(
             serde_json::to_string(&request)
@@ -1530,12 +1538,12 @@ async fn ipc_exchange(mut stream: UnixStream, request: Value) -> Result<Value, S
         .map_err(|e| e.to_string())?;
     stream.write_all(b"\n").await.map_err(|e| e.to_string())?;
     let mut line = String::new();
-    let mut reader = BufReader::new(stream).take(65537);
-    tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line))
+    let mut reader = BufReader::new(stream).take(reply_limit as u64 + 1);
+    tokio::time::timeout(reply_timeout, reader.read_line(&mut line))
         .await
         .map_err(|_| "Controller response timeout")?
         .map_err(|e| e.to_string())?;
-    if line.len() > 65536 || !line.ends_with('\n') {
+    if line.len() > reply_limit || !line.ends_with('\n') {
         return Err("invalid or oversized Controller response".into());
     }
     serde_json::from_str(&line).map_err(|e| format!("invalid Controller response: {e}"))

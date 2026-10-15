@@ -50,6 +50,72 @@ async fn response(reader: &mut BufReader<UnixStream>) -> Value {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn controller_log_tail_larger_than_status_reply_budget_remains_readable() {
+    let mut runtime = runtime();
+    for index in 0..100 {
+        log_line(
+            &runtime.log,
+            "runner",
+            format!("{index:03}:{}", "x".repeat(900)),
+        );
+    }
+    let (server, client) = UnixStream::pair().unwrap();
+    let server_task = tokio::spawn(async move { handle_ipc(&mut runtime, server).await });
+    let received = ipc_exchange(client, json!({"method":"logs","lines":100})).await;
+    let _ = server_task.await;
+    let response = received.expect("bounded 100-line log tail must remain readable");
+    let lines = response["result"]["lines"].as_array().unwrap();
+    assert_eq!(lines.len(), 100);
+    assert!(lines[0].as_str().unwrap().contains("000:"));
+    assert!(lines[99].as_str().unwrap().contains("099:"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn status_ipc_keeps_small_reply_limit() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let sender = tokio::spawn(async move {
+        let mut request = String::new();
+        BufReader::new(&mut server)
+            .read_line(&mut request)
+            .await
+            .unwrap();
+        let oversized = json!({"ok":true,"result":{"line":"x".repeat(70_000)}});
+        let _ = write_log_response(&mut server, oversized).await;
+    });
+    let rejected = ipc_exchange(client, json!({"method":"status"}))
+        .await
+        .unwrap_err();
+    assert!(rejected.contains("oversized"), "{rejected}");
+    sender.await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn restart_ipc_waits_for_valid_long_running_component_restart() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let sender = tokio::spawn(async move {
+        let mut request = String::new();
+        BufReader::new(&mut server)
+            .read_line(&mut request)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&request).unwrap()["method"],
+            "restart"
+        );
+        // Existing local/remote restart may legitimately wait for child
+        // shutdown and startup readiness, far longer than a status query.
+        tokio::time::sleep(Duration::from_millis(3300)).await;
+        let _ = write_log_response(&mut server, json!({"ok":true,"result":{"started":true}})).await;
+    });
+    let reply = ipc_exchange(client, json!({"method":"restart","component":"runner"})).await;
+    sender.await.unwrap();
+    assert_eq!(reply.unwrap()["result"]["started"], true);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn follows_new_entries_without_duplicates_or_blocking_control_requests() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let mut runtime = runtime();
