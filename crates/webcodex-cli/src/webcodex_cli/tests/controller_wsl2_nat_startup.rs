@@ -247,7 +247,8 @@ async fn live_runner_prevents_discovery_and_auth_exit_does_not_restart() {
     let (_tmp, cfg) = fixture();
     let mut runtime = ControllerRuntime::new(cfg);
     // Dedicated fixture owns stdin; EOF stops cat, and both output pipes are drained.
-    let mut command = Command::new("cat");
+    // Avoid ambient PATH, which other CLI tests temporarily override.
+    let mut command = Command::new("/bin/cat");
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -269,7 +270,7 @@ async fn live_runner_prevents_discovery_and_auth_exit_does_not_restart() {
         .is_none());
     runtime.stop_component(Component::Runner).await;
     assert!(runtime.runner.process.is_none());
-    let mut command = Command::new("sh");
+    let mut command = Command::new("/bin/sh");
     command
         .args(["-c", "exit 77"])
         .stdin(Stdio::null())

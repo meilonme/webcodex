@@ -31,7 +31,9 @@ fn fixture(server: &str, mode: ServerMode) -> (tempfile::TempDir, ControllerRunt
 
 fn attach_process(runtime: &mut ControllerRuntime) {
     // EOF, not the invoking terminal, owns this disposable process lifetime.
-    let mut command = Command::new("cat");
+    // Use an absolute POSIX utility path: parallel test PATH changes must not
+    // make the mock Runner fail to spawn before observation is exercised.
+    let mut command = Command::new("/bin/cat");
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
